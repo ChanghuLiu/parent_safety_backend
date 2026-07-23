@@ -1,28 +1,40 @@
-from datetime import datetime
+from datetime import datetime, time
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StringConstraints, field_validator
+from typing_extensions import Annotated
+
+
+ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=100)]
+PhoneText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
+DeviceId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=8, max_length=255)]
+FcmToken = Annotated[str, StringConstraints(strip_whitespace=True, min_length=16, max_length=4096)]
 
 
 class RegisterRequest(BaseModel):
     role: Literal["elder", "child"]
-    name: str
-    phone: str
-    device_id: str
+    name: ShortText
+    phone: PhoneText
+    device_id: DeviceId
 
 
 class RegisterResponse(BaseModel):
     user_id: int
     role: str
+    api_token: str
 
 
 class UpdateFcmTokenRequest(BaseModel):
     user_id: int
-    fcm_token: str
+    fcm_token: FcmToken
 
 
 class SuccessResponse(BaseModel):
     success: bool
+
+
+class UnbindRequest(BaseModel):
+    family_link_id: int = Field(gt=0)
 
 
 class ElderHeartbeatRequest(BaseModel):
@@ -43,9 +55,16 @@ class UpdateOfflineAlertSettingsRequest(BaseModel):
     offline_alert_enabled: bool
     offline_alert_hours: int = Field(ge=1, le=168)
     quiet_hours_enabled: bool = True
-    quiet_start_time: str = "22:00"
-    quiet_end_time: str = "07:00"
-    offline_pause_until: str | None = None
+    quiet_start_time: time = time(22, 0)
+    quiet_end_time: time = time(7, 0)
+    offline_pause_until: datetime | None = None
+
+    @field_validator("quiet_start_time", "quiet_end_time")
+    @classmethod
+    def quiet_time_must_not_include_timezone(cls, value: time) -> time:
+        if value.tzinfo is not None:
+            raise ValueError("quiet time must be a local HH:MM value")
+        return value
 
 
 class CreateBindCodeRequest(BaseModel):
@@ -59,14 +78,15 @@ class CreateBindCodeResponse(BaseModel):
 
 class BindElderRequest(BaseModel):
     child_user_id: int
-    code: str = Field(min_length=6, max_length=6)
-    elder_relationship: str
-    elder_name: str
-    elder_phone: str
+    code: str = Field(pattern=r"^\d{6}$")
+    elder_relationship: ShortText
+    elder_name: ShortText
+    elder_phone: PhoneText
 
 
 class BindElderResponse(BaseModel):
     success: bool
+    family_link_id: int
     elder_user_id: int
     elder_relationship: str
     elder_name: str
@@ -85,8 +105,8 @@ class ElderCheckinResponse(BaseModel):
 
 class HelpRequestCreate(BaseModel):
     elder_user_id: int
-    type: str
-    message: str = ""
+    type: Literal["call_back", "not_feeling_well", "errand", "other"]
+    message: str = Field(default="", max_length=500)
 
 
 class HelpRequestResponse(BaseModel):
@@ -104,6 +124,7 @@ class PendingHelpRequest(BaseModel):
 
 
 class ElderStatusResponse(BaseModel):
+    family_link_id: int
     elder_user_id: int
     elder_relationship: str
     elder_name: str

@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -7,6 +7,9 @@ from database import Base
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        UniqueConstraint("device_id", "role", name="uq_users_device_role"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     role = Column(String, nullable=False, index=True)
@@ -14,7 +17,15 @@ class User(Base):
     phone = Column(String, nullable=False)
     device_id = Column(String, nullable=False, index=True)
     fcm_token = Column(String, nullable=True)
+    api_token_hash = Column(String(64), nullable=True, unique=True, index=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class DeletedApiToken(Base):
+    __tablename__ = "deleted_api_tokens"
+
+    token_hash = Column(String(64), primary_key=True)
+    deleted_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 class BindCode(Base):
@@ -30,8 +41,19 @@ class BindCode(Base):
     elder = relationship("User")
 
 
+class BindAttempt(Base):
+    __tablename__ = "bind_attempts"
+
+    id = Column(Integer, primary_key=True)
+    child_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    attempted_at = Column(DateTime, nullable=False, index=True)
+
+
 class FamilyLink(Base):
     __tablename__ = "family_links"
+    __table_args__ = (
+        UniqueConstraint("elder_user_id", "child_user_id", name="uq_family_link_pair"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     elder_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
