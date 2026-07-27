@@ -827,6 +827,7 @@ def elder_checkin(
         checkin_date=local_now.date(),
         checkin_time=checkin_time,
         battery_level=payload.battery_level,
+        created_at=now,
     )
     db.add(checkin)
 
@@ -910,21 +911,53 @@ def elder_checkins(
     else:
         raise HTTPException(status_code=403, detail="role is not authorized")
 
-    records = (
+    checkins = (
         db.query(models.DailyCheckin)
         .filter(models.DailyCheckin.elder_user_id == elder_user_id)
         .order_by(models.DailyCheckin.created_at.desc(), models.DailyCheckin.id.desc())
         .limit(5)
         .all()
     )
-    return [
-        {
-            "checkin_date": record.checkin_date.isoformat(),
-            "checkin_time": record.checkin_time,
-            "battery_level": record.battery_level,
-        }
-        for record in records
+    help_requests = (
+        db.query(models.HelpRequest)
+        .filter(models.HelpRequest.elder_user_id == elder_user_id)
+        .order_by(models.HelpRequest.created_at.desc(), models.HelpRequest.id.desc())
+        .limit(5)
+        .all()
+    )
+
+    records = [
+        (
+            record.created_at,
+            record.id,
+            {
+                "event_type": "checkin",
+                "record_date": record.checkin_date.isoformat(),
+                "record_time": record.checkin_time,
+                "message": "I'm fine",
+                "battery_level": record.battery_level,
+            },
+        )
+        for record in checkins
     ]
+    for record in help_requests:
+        local_created_at = _as_local(record.created_at)
+        records.append(
+            (
+                record.created_at,
+                record.id,
+                {
+                    "event_type": "help_request",
+                    "record_date": local_created_at.date().isoformat(),
+                    "record_time": local_created_at.strftime("%H:%M"),
+                    "message": record.message,
+                    "battery_level": None,
+                },
+            )
+        )
+
+    records.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [record for _, _, record in records[:5]]
 
 
 @app.post("/api/elder/heartbeat", response_model=schemas.SuccessResponse)
@@ -977,6 +1010,7 @@ def create_help_request(
         type=payload.type,
         message=message,
         status="pending",
+        created_at=_now(),
     )
     db.add(help_request)
     db.commit()

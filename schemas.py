@@ -104,9 +104,11 @@ class ElderCheckinResponse(BaseModel):
 
 
 class ElderCheckinRecordResponse(BaseModel):
-    checkin_date: str
-    checkin_time: str
-    battery_level: int
+    event_type: Literal["checkin", "help_request"]
+    record_date: str
+    record_time: str
+    message: str
+    battery_level: int | None = None
 
 
 class HelpRequestCreate(BaseModel):

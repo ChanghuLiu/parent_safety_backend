@@ -513,15 +513,29 @@ def test_checkin_history_returns_newest_five_to_family_only(api):
         )
         assert response.status_code == 200
 
+    help_response = client.post(
+        "/api/elder/help-request",
+        headers=bearer(elder["api_token"]),
+        json={
+            "elder_user_id": elder["user_id"],
+            "type": "call_back",
+            "message": "Please call me back",
+        },
+    )
+    assert help_response.status_code == 200
+
     path = f"/api/elder/{elder['user_id']}/checkins"
     elder_history = client.get(path, headers=bearer(elder["api_token"]))
     assert elder_history.status_code == 200
-    assert [record["battery_level"] for record in elder_history.json()] == [
-        15,
-        14,
-        13,
-        12,
-        11,
+    assert [
+        (record["event_type"], record["message"], record["battery_level"])
+        for record in elder_history.json()
+    ] == [
+        ("help_request", "Please call me back", None),
+        ("checkin", "I'm fine", 15),
+        ("checkin", "I'm fine", 14),
+        ("checkin", "I'm fine", 13),
+        ("checkin", "I'm fine", 12),
     ]
 
     child_history = client.get(path, headers=bearer(child["api_token"]))
