@@ -409,6 +409,8 @@ def test_used_and_expired_bind_codes_are_rejected(api):
         headers=bearer(elder["api_token"]),
         json={"elder_user_id": elder["user_id"]},
     )
+    assert code_response.status_code == 200
+    assert code_response.json()["expires_in_minutes"] == 30
     code = code_response.json()["code"]
     db = main.SessionLocal()
     try:

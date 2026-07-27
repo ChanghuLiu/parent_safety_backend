@@ -51,6 +51,7 @@ PRODUCTION_ORIGINS = [
     "http://95.41.57.202",
     "https://95.41.57.202",
 ]
+BIND_CODE_EXPIRY_MINUTES = 30
 OFFLINE_ALERT_INTERVAL_SECONDS = int(
     os.getenv("OFFLINE_ALERT_INTERVAL_SECONDS", "900")
 )
@@ -699,7 +700,7 @@ def create_bind_code(
                 candidate_bind_code = models.BindCode(
                     elder_user_id=payload.elder_user_id,
                     code=candidate,
-                    expires_at=_now() + timedelta(minutes=30),
+                    expires_at=_now() + timedelta(minutes=BIND_CODE_EXPIRY_MINUTES),
                     used=False,
                 )
                 db.add(candidate_bind_code)
@@ -716,7 +717,7 @@ def create_bind_code(
         db.rollback()
         raise HTTPException(status_code=503, detail="could not allocate bind code")
     db.commit()
-    return {"code": code, "expires_in_minutes": 10}
+    return {"code": code, "expires_in_minutes": BIND_CODE_EXPIRY_MINUTES}
 
 
 @app.post("/api/child/bind-elder", response_model=schemas.BindElderResponse)
