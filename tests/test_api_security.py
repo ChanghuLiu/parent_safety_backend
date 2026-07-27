@@ -495,6 +495,45 @@ def test_checkin_uses_exact_data_only_fcm_payload(api, monkeypatch):
     assert all(isinstance(value, str) for value in data.values())
 
 
+def test_checkin_history_returns_newest_five_to_family_only(api):
+    client, _ = api
+    elder = register(client, "elder", "elder-device-0013")
+    child = register(client, "child", "child-device-0013")
+    unrelated_child = register(client, "child", "child-device-0014")
+    create_binding(client, elder, child)
+
+    for battery_level in range(10, 16):
+        response = client.post(
+            "/api/elder/checkin",
+            headers=bearer(elder["api_token"]),
+            json={
+                "elder_user_id": elder["user_id"],
+                "battery_level": battery_level,
+            },
+        )
+        assert response.status_code == 200
+
+    path = f"/api/elder/{elder['user_id']}/checkins"
+    elder_history = client.get(path, headers=bearer(elder["api_token"]))
+    assert elder_history.status_code == 200
+    assert [record["battery_level"] for record in elder_history.json()] == [
+        15,
+        14,
+        13,
+        12,
+        11,
+    ]
+
+    child_history = client.get(path, headers=bearer(child["api_token"]))
+    assert child_history.status_code == 200
+    assert child_history.json() == elder_history.json()
+
+    assert client.get(
+        path,
+        headers=bearer(unrelated_child["api_token"]),
+    ).status_code == 403
+
+
 def test_help_request_uses_exact_data_only_fcm_payload(api, monkeypatch):
     client, main = api
     elder = register(client, "elder", "elder-device-0010")

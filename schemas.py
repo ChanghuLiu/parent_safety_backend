@@ -103,6 +103,12 @@ class ElderCheckinResponse(BaseModel):
     checkin_time: str
 
 
+class ElderCheckinRecordResponse(BaseModel):
+    checkin_date: str
+    checkin_time: str
+    battery_level: int
+
+
 class HelpRequestCreate(BaseModel):
     elder_user_id: int
     type: Literal["call_back", "not_feeling_well", "errand", "other"]

@@ -884,6 +884,47 @@ def elder_checkin(
     return {"success": True, "message": "今日已确认平安", "checkin_time": checkin_time}
 
 
+@app.get(
+    "/api/elder/{elder_user_id}/checkins",
+    response_model=list[schemas.ElderCheckinRecordResponse],
+)
+def elder_checkins(
+    elder_user_id: int,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _get_user_or_404(db, elder_user_id, role="elder")
+    if current_user.role == "elder":
+        _authorize_user(current_user, elder_user_id, "elder")
+    elif current_user.role == "child":
+        linked = (
+            db.query(models.FamilyLink)
+            .filter(
+                models.FamilyLink.child_user_id == current_user.id,
+                models.FamilyLink.elder_user_id == elder_user_id,
+            )
+            .first()
+        )
+        if linked is None:
+            raise HTTPException(status_code=403, detail="family link required")
+    else:
+        raise HTTPException(status_code=403, detail="role is not authorized")
+
+    records = (
+        db.query(models.DailyCheckin)
+        .filter(models.DailyCheckin.elder_user_id == elder_user_id)
+        .order_by(models.DailyCheckin.created_at.desc(), models.DailyCheckin.id.desc())
+        .limit(5)
+        .all()
+    )
+    return [
+        {
+            "checkin_date": record.checkin_date.isoformat(),
+            "checkin_time": record.checkin_time,
+            "battery_level": record.battery_level,
+        }
+        for record in records
+    ]
 
 
 @app.post("/api/elder/heartbeat", response_model=schemas.SuccessResponse)
