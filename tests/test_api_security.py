@@ -454,6 +454,47 @@ def test_used_and_expired_bind_codes_are_rejected(api):
     ).status_code == 400
 
 
+def test_checkin_uses_exact_data_only_fcm_payload(api, monkeypatch):
+    client, main = api
+    elder = register(client, "elder", "elder-device-0012")
+    child = register(client, "child", "child-device-0012")
+    create_binding(client, elder, child)
+
+    db = main.SessionLocal()
+    try:
+        child_user = db.query(main.models.User).filter(
+            main.models.User.id == child["user_id"]
+        ).one()
+        child_user.fcm_token = "fcm-token-value-long-enough"
+        db.commit()
+    finally:
+        db.close()
+
+    sent = []
+
+    def capture_data_message(token, data):
+        sent.append((token, data))
+        return True
+
+    monkeypatch.setattr(main, "_send_fcm_data_notification", capture_data_message)
+    response = client.post(
+        "/api/elder/checkin",
+        headers=bearer(elder["api_token"]),
+        json={"elder_user_id": elder["user_id"], "battery_level": 80},
+    )
+    assert response.status_code == 200
+    assert len(sent) == 1
+    token, data = sent[0]
+    assert token == "fcm-token-value-long-enough"
+    assert data == {
+        "event_type": "checkin",
+        "child_user_id": str(child["user_id"]),
+        "elder_user_id": str(elder["user_id"]),
+        "checkin_time": response.json()["checkin_time"],
+    }
+    assert all(isinstance(value, str) for value in data.values())
+
+
 def test_help_request_uses_exact_data_only_fcm_payload(api, monkeypatch):
     client, main = api
     elder = register(client, "elder", "elder-device-0010")

@@ -865,9 +865,13 @@ def elder_checkin(
         child = db.query(models.User).filter(models.User.id == link.child_user_id).first()
         if child is None or not child.fcm_token:
             continue
-        title = f"{link.elder_relationship} {link.elder_name} 已确认平安"
-        body = f"今天 {checkin_time} 已确认：我很好"
-        if _send_fcm_notification(child.fcm_token, title, body):
+        data = {
+            "event_type": "checkin",
+            "child_user_id": str(link.child_user_id),
+            "elder_user_id": str(payload.elder_user_id),
+            "checkin_time": checkin_time,
+        }
+        if _send_fcm_data_notification(child.fcm_token, data):
             logger.info("checkin FCM send success child_user_id=%s", link.child_user_id)
         else:
             logger.error("checkin FCM send error child_user_id=%s", link.child_user_id)
