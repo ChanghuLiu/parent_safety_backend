@@ -410,6 +410,16 @@ def test_used_and_expired_bind_codes_are_rejected(api):
         json={"elder_user_id": elder["user_id"]},
     )
     code = code_response.json()["code"]
+    db = main.SessionLocal()
+    try:
+        bind_code = db.query(main.models.BindCode).filter(
+            main.models.BindCode.code == code
+        ).one()
+        remaining = bind_code.expires_at - main._now()
+        assert timedelta(minutes=29, seconds=55) < remaining <= timedelta(minutes=30)
+    finally:
+        db.close()
+
     create_payload = {
         "child_user_id": first_child["user_id"],
         "code": code,

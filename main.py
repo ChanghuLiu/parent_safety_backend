@@ -699,7 +699,7 @@ def create_bind_code(
                 candidate_bind_code = models.BindCode(
                     elder_user_id=payload.elder_user_id,
                     code=candidate,
-                    expires_at=_now() + timedelta(minutes=10),
+                    expires_at=_now() + timedelta(minutes=30),
                     used=False,
                 )
                 db.add(candidate_bind_code)
