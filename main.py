@@ -10,10 +10,11 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import firebase_admin
-    from firebase_admin import credentials, messaging
+    from firebase_admin import credentials, exceptions as firebase_exceptions, messaging
 except ImportError:  # Firebase is optional until push credentials are configured.
     firebase_admin = None
     credentials = None
+    firebase_exceptions = None
     messaging = None
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -29,6 +30,11 @@ from sqlalchemy.orm import Session
 import models
 import schemas
 from database import Base, SessionLocal, engine, get_db
+from harmonyos_push import (
+    DeliveryStatus,
+    HarmonyOSNotification,
+    get_harmonyos_push_provider,
+)
 
 
 logger = logging.getLogger("parent_safety")
@@ -67,13 +73,16 @@ except ZoneInfoNotFoundError as exc:
 allowed_hosts = list(PRODUCTION_HOSTS)
 allowed_origins = list(PRODUCTION_ORIGINS)
 if not IS_PRODUCTION:
-    allowed_hosts.extend(["localhost", "127.0.0.1", "testserver"])
+    allowed_hosts.extend(["localhost", "127.0.0.1", "testserver", "192.168.64.67"])
     allowed_origins.extend(
         [
             "http://localhost",
             "http://localhost:8000",
             "http://127.0.0.1",
             "http://127.0.0.1:8000",
+            "http://192.168.64.67",
+            "http://192.168.64.67:8000",
+            "testserver",
         ]
     )
 
@@ -139,6 +148,13 @@ def _ensure_sqlite_migrations():
         if "fcm_token" not in column_names:
             connection.execute(sql_text("ALTER TABLE users ADD COLUMN fcm_token VARCHAR"))
             logger.info("migration added users.fcm_token column")
+        if "fcm_token_invalidated_at" not in column_names:
+            connection.execute(
+                sql_text(
+                    "ALTER TABLE users ADD COLUMN fcm_token_invalidated_at DATETIME"
+                )
+            )
+            logger.info("migration added users.fcm_token_invalidated_at column")
         if "api_token_hash" not in column_names:
             connection.execute(sql_text("ALTER TABLE users ADD COLUMN api_token_hash VARCHAR(64)"))
             logger.info("migration added users.api_token_hash column")
@@ -146,6 +162,33 @@ def _ensure_sqlite_migrations():
             sql_text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_api_token_hash "
                 "ON users(api_token_hash) WHERE api_token_hash IS NOT NULL"
+            )
+        )
+        connection.execute(
+            sql_text(
+                """
+                CREATE TABLE IF NOT EXISTS device_push_tokens (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    user_id INTEGER NOT NULL,
+                    platform VARCHAR(32) NOT NULL,
+                    push_provider VARCHAR(32) NOT NULL,
+                    push_token VARCHAR(4096) NOT NULL,
+                    push_token_updated_at DATETIME NOT NULL,
+                    push_token_invalidated_at DATETIME,
+                    CONSTRAINT fk_device_push_tokens_user_id_users
+                        FOREIGN KEY(user_id) REFERENCES users (id),
+                    CONSTRAINT uq_device_push_tokens_user_provider
+                        UNIQUE (user_id, push_provider),
+                    CONSTRAINT uq_device_push_tokens_provider_token
+                        UNIQUE (push_provider, push_token)
+                )
+                """
+            )
+        )
+        connection.execute(
+            sql_text(
+                "CREATE INDEX IF NOT EXISTS ix_device_push_tokens_user_id "
+                "ON device_push_tokens(user_id)"
             )
         )
         connection.execute(
@@ -174,6 +217,46 @@ def _ensure_sqlite_migrations():
                 )
                 BEGIN
                     SELECT RAISE(ABORT, 'duplicate active bind code');
+                END
+                """
+            )
+        )
+
+        device_status_columns = connection.execute(
+            sql_text("PRAGMA table_info(device_status)")
+        ).fetchall()
+        device_status_column_names = {column[1] for column in device_status_columns}
+        if "platform" not in device_status_column_names:
+            connection.execute(
+                sql_text("ALTER TABLE device_status ADD COLUMN platform VARCHAR")
+            )
+            logger.info("migration added device_status.platform column")
+        if "app_version" not in device_status_column_names:
+            connection.execute(
+                sql_text("ALTER TABLE device_status ADD COLUMN app_version VARCHAR")
+            )
+            logger.info("migration added device_status.app_version column")
+        if "device_uuid" not in device_status_column_names:
+            connection.execute(
+                sql_text("ALTER TABLE device_status ADD COLUMN device_uuid VARCHAR")
+            )
+            logger.info("migration added device_status.device_uuid column")
+
+        # Preserve legacy same-day rows, but prevent all future duplicate
+        # inserts. Fresh databases also receive the model's unique index.
+        connection.execute(
+            sql_text(
+                """
+                CREATE TRIGGER IF NOT EXISTS prevent_duplicate_daily_checkin
+                BEFORE INSERT ON daily_checkins
+                WHEN EXISTS (
+                    SELECT 1
+                    FROM daily_checkins
+                    WHERE elder_user_id = NEW.elder_user_id
+                      AND checkin_date = NEW.checkin_date
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'duplicate daily checkin');
                 END
                 """
             )
@@ -258,7 +341,43 @@ def _get_firebase_app():
         return None
 
 
-def _send_fcm_notification(token: str, title: str, body: str) -> bool:
+def _push_delivery_enabled() -> bool:
+    return os.getenv("PUSH_DELIVERY_ENABLED", "true").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _is_invalid_registration_token_error(exc: Exception) -> bool:
+    """Recognize Firebase's narrowly defined malformed-token responses."""
+    invalid_argument_error = getattr(firebase_exceptions, "InvalidArgumentError", ())
+    if not invalid_argument_error or not isinstance(exc, invalid_argument_error):
+        return False
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "registration token is not a valid fcm registration token",
+            "invalid registration token",
+        )
+    )
+
+
+def _log_invalid_fcm_token() -> None:
+    logger.warning("FCM token invalidated: registration token is no longer valid")
+
+
+def _send_fcm_notification(
+    token: str,
+    title: str,
+    body: str,
+    invalid_token_handler=None,
+) -> bool:
+    if not _push_delivery_enabled():
+        logger.info("Push delivery disabled; notification skipped in development.")
+        return False
     app = _get_firebase_app()
     if app is None:
         return False
@@ -269,12 +388,30 @@ def _send_fcm_notification(token: str, title: str, body: str) -> bool:
         )
         messaging.send(message, app=app)
         return True
+    except messaging.UnregisteredError:
+        (invalid_token_handler or (lambda: _invalidate_fcm_token(token)))()
+        _log_invalid_fcm_token()
+        return False
     except Exception as exc:
-        logger.error("FCM send failed: %s", exc, exc_info=True)
+        if _is_invalid_registration_token_error(exc):
+            (invalid_token_handler or (lambda: _invalidate_fcm_token(token)))()
+            _log_invalid_fcm_token()
+            return False
+        logger.error(
+            "FCM send failed exception_type=%s",
+            type(exc).__name__,
+        )
         return False
 
 
-def _send_fcm_data_notification(token: str, data: dict[str, str]) -> bool:
+def _send_fcm_data_notification(
+    token: str,
+    data: dict[str, str],
+    invalid_token_handler=None,
+) -> bool:
+    if not _push_delivery_enabled():
+        logger.info("Push delivery disabled; notification skipped in development.")
+        return False
     app = _get_firebase_app()
     if app is None:
         return False
@@ -289,14 +426,267 @@ def _send_fcm_data_notification(token: str, data: dict[str, str]) -> bool:
         )
         messaging.send(message, app=app)
         return True
+    except messaging.UnregisteredError:
+        (invalid_token_handler or (lambda: _invalidate_fcm_token(token)))()
+        _log_invalid_fcm_token()
+        return False
     except Exception as exc:
-        logger.error("FCM data send failed: %s", exc, exc_info=True)
+        if _is_invalid_registration_token_error(exc):
+            (invalid_token_handler or (lambda: _invalidate_fcm_token(token)))()
+            _log_invalid_fcm_token()
+            return False
+        logger.error(
+            "FCM data send failed exception_type=%s",
+            type(exc).__name__,
+        )
         return False
 
 
 def _now() -> datetime:
     """Return a naive UTC datetime for consistent SQLite storage."""
     return datetime.now(ZoneInfo("UTC")).replace(tzinfo=None)
+
+
+def _invalidate_fcm_token(token: str) -> None:
+    """Clear only records that still contain the token rejected by Firebase."""
+    db = SessionLocal()
+    try:
+        invalidated_at = _now()
+        users = (
+            db.query(models.User)
+            .filter(models.User.fcm_token == token)
+            .all()
+        )
+        for user in users:
+            user.fcm_token = None
+            user.fcm_token_invalidated_at = invalidated_at
+        registrations = (
+            db.query(models.DevicePushToken)
+            .filter(
+                models.DevicePushToken.push_provider == "fcm",
+                models.DevicePushToken.push_token == token,
+            )
+            .all()
+        )
+        for registration in registrations:
+            registration.push_token_invalidated_at = invalidated_at
+        if users or registrations:
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to persist FCM token invalidation")
+    finally:
+        db.close()
+
+
+def _normalized_platform(platform: str | None) -> str | None:
+    if platform is None:
+        return None
+    return platform.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _push_provider_for_user(db: Session, user: models.User) -> str | None:
+    status = (
+        db.query(models.DeviceStatus)
+        .filter(models.DeviceStatus.user_id == user.id)
+        .first()
+    )
+    platform = _normalized_platform(status.platform if status else None)
+    if platform in {"harmonyos", "harmony_os"}:
+        return "harmonyos"
+    if platform in {"android_huawei", "huawei", "android_hms"}:
+        return "android_huawei"
+    if platform in {"android_google", "android", "google", "android_gms"}:
+        return "fcm"
+    # Existing releases stored only fcm_token. Preserve those valid Android
+    # registrations while all newly identified platforms route explicitly.
+    if platform is None and user.fcm_token:
+        return "fcm"
+    return None
+
+
+def _active_device_push_token(
+    db: Session,
+    user_id: int,
+    provider: str,
+) -> models.DevicePushToken | None:
+    return (
+        db.query(models.DevicePushToken)
+        .filter(
+            models.DevicePushToken.user_id == user_id,
+            models.DevicePushToken.push_provider == provider,
+            models.DevicePushToken.push_token_invalidated_at.is_(None),
+        )
+        .first()
+    )
+
+
+def _masked_token_suffix(token: str) -> str:
+    return f"***{token[-4:]}" if len(token) > 4 else "***"
+
+
+def _send_harmonyos_notification(
+    db: Session,
+    user: models.User,
+    notification: HarmonyOSNotification,
+) -> bool:
+    registration = _active_device_push_token(db, user.id, "harmonyos")
+    if registration is None:
+        logger.info(
+            "push skipped user_id=%s provider=harmonyos event_type=%s result=no_token",
+            user.id,
+            notification.event_type,
+        )
+        return False
+
+    token = registration.push_token
+    try:
+        result = get_harmonyos_push_provider().send(token, notification)
+    except Exception as exc:
+        logger.error(
+            "push result user_id=%s provider=harmonyos event_type=%s "
+            "http_status=None provider_code=None result=temporary_failure "
+            "exception_type=%s token_length=%s token_suffix=%s",
+            user.id,
+            notification.event_type,
+            type(exc).__name__,
+            len(token),
+            _masked_token_suffix(token),
+        )
+        return False
+    log = logger.warning if result.status == DeliveryStatus.INVALID_TOKEN else logger.info
+    log(
+        "push result user_id=%s provider=harmonyos event_type=%s "
+        "http_status=%s provider_code=%s result=%s token_length=%s token_suffix=%s",
+        user.id,
+        notification.event_type,
+        result.http_status,
+        result.provider_code,
+        result.status.value,
+        len(token),
+        _masked_token_suffix(token),
+    )
+
+    if result.status == DeliveryStatus.INVALID_TOKEN:
+        current_registration = (
+            db.query(models.DevicePushToken)
+            .filter(
+                models.DevicePushToken.id == registration.id,
+                models.DevicePushToken.push_token == token,
+            )
+            .first()
+        )
+        if (
+            current_registration is not None
+            and current_registration.push_token_invalidated_at is None
+        ):
+            try:
+                current_registration.push_token_invalidated_at = _now()
+                db.commit()
+            except Exception as exc:
+                db.rollback()
+                logger.error(
+                    "push token invalidation persistence failed user_id=%s "
+                    "provider=harmonyos exception_type=%s",
+                    user.id,
+                    type(exc).__name__,
+                )
+    return result.accepted
+
+
+def _send_push_notification(
+    db: Session,
+    user: models.User,
+    title: str,
+    body: str,
+    *,
+    event_type: str = "notification",
+    family_link_id: int | None = None,
+) -> bool:
+    provider = _push_provider_for_user(db, user)
+    if provider == "fcm":
+        if not user.fcm_token:
+            logger.info("push skipped user_id=%s provider=fcm: no token", user.id)
+            return False
+        token = user.fcm_token
+
+        def invalidate_token():
+            if user.fcm_token == token:
+                invalidated_at = _now()
+                user.fcm_token = None
+                user.fcm_token_invalidated_at = invalidated_at
+                registration = (
+                    db.query(models.DevicePushToken)
+                    .filter(
+                        models.DevicePushToken.user_id == user.id,
+                        models.DevicePushToken.push_provider == "fcm",
+                        models.DevicePushToken.push_token == token,
+                    )
+                    .first()
+                )
+                if registration is not None:
+                    registration.push_token_invalidated_at = invalidated_at
+                db.commit()
+
+        return _send_fcm_notification(
+            token,
+            title,
+            body,
+            invalidate_token,
+        )
+    if provider == "android_huawei":
+        logger.info("push skipped user_id=%s: Huawei Android Push unavailable", user.id)
+        return False
+    if provider == "harmonyos":
+        harmony_title = (
+            "家人长时间未在线"
+            if event_type == "offline_alert"
+            else title
+        )
+        return _send_harmonyos_notification(
+            db,
+            user,
+            HarmonyOSNotification(
+                title=harmony_title,
+                body=body,
+                category="DEVICE_REMINDER",
+                event_type=event_type,
+                family_link_id=family_link_id,
+                target_page="elder_status",
+            ),
+        )
+    logger.info("push skipped user_id=%s: no valid push provider", user.id)
+    return False
+
+
+def _send_push_data_notification(
+    db: Session,
+    user: models.User,
+    data: dict[str, str],
+    *,
+    harmony_notification: HarmonyOSNotification | None = None,
+) -> bool:
+    provider = _push_provider_for_user(db, user)
+    if provider == "fcm":
+        if not user.fcm_token:
+            logger.info("push skipped user_id=%s provider=fcm: no token", user.id)
+            return False
+        return _send_fcm_data_notification(user.fcm_token, data)
+    if provider == "android_huawei":
+        logger.info("push skipped user_id=%s: Huawei Android Push unavailable", user.id)
+        return False
+    if provider == "harmonyos":
+        if harmony_notification is None:
+            logger.info(
+                "push skipped user_id=%s provider=harmonyos event_type=%s "
+                "result=unsupported_notification",
+                user.id,
+                data.get("event_type", "unknown"),
+            )
+            return False
+        return _send_harmonyos_notification(db, user, harmony_notification)
+    logger.info("push skipped user_id=%s: no valid push provider", user.id)
+    return False
 
 
 def _local_now() -> datetime:
@@ -317,6 +707,12 @@ def _normalize_input_datetime(value: datetime | None) -> str | None:
         .replace(tzinfo=None)
         .isoformat(timespec="seconds")
     )
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=APP_TIMEZONE)
+    return value.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
 
 
 def _hash_api_token(token: str) -> str:
@@ -456,17 +852,24 @@ def check_offline_alerts(db: Session) -> int:
             continue
 
         child = db.query(models.User).filter(models.User.id == link.child_user_id).first()
-        if child is None or not child.fcm_token:
+        if child is None:
             logger.info("offline alert skipped child_user_id=%s: no token", link.child_user_id)
             continue
 
         title = "手机长时间未在线"
         body = "可能是手机没电、关机或没有网络，请联系确认。"
-        if _send_fcm_notification(child.fcm_token, title, body):
+        if _send_push_notification(
+            db,
+            child,
+            title,
+            body,
+            event_type="offline_alert",
+            family_link_id=link.id,
+        ):
             link.last_offline_alert_sent_at = now.isoformat(timespec="seconds")
             sent_count += 1
         else:
-            logger.error("offline alert FCM send failed child_user_id=%s elder_user_id=%s", link.child_user_id, link.elder_user_id)
+            logger.info("offline alert push not delivered child_user_id=%s elder_user_id=%s", link.child_user_id, link.elder_user_id)
 
     if sent_count:
         db.commit()
@@ -501,6 +904,24 @@ def _get_user_or_404(db: Session, user_id: int, role: str | None = None) -> mode
         detail = f"{role or 'user'} not found"
         raise HTTPException(status_code=404, detail=detail)
     return user
+
+
+def _serialize_help_alert(
+    help_request: models.HelpRequest,
+    parent: models.User,
+    family_link_id: int,
+) -> dict:
+    return {
+        "alert_id": help_request.id,
+        "alert_type": help_request.type,
+        "type": help_request.type,
+        "message": help_request.message,
+        "created_at": help_request.created_at,
+        "status": help_request.status,
+        "elder_user_id": help_request.elder_user_id,
+        "parent_device_id": parent.device_id,
+        "family_link_id": family_link_id,
+    }
 
 
 @app.get("/api/health", response_model=schemas.HealthResponse)
@@ -565,17 +986,189 @@ def register(
 
 
 
-@app.post("/api/user/update-fcm-token", response_model=schemas.SuccessResponse)
+SUPPORTED_PUSH_COMBINATIONS = {
+    ("android_google", "fcm"),
+    ("android_huawei", "huawei_android"),
+    ("harmonyos", "harmonyos"),
+}
+DEFAULT_PROVIDER_BY_PLATFORM = {
+    "android_google": "fcm",
+    "android_huawei": "huawei_android",
+    "harmonyos": "harmonyos",
+}
+
+
+def _resolve_push_platform_provider(
+    payload: schemas.UpdateFcmTokenRequest,
+) -> tuple[str, str]:
+    platform = _normalized_platform(payload.platform)
+    provider = _normalized_platform(payload.push_provider)
+
+    # Legacy Android clients sent only user_id/fcm_token, or added platform
+    # without a provider. Keep those payloads working while new clients send
+    # the explicit provider-neutral fields.
+    if platform is None and provider is None and payload.fcm_token is not None:
+        return "android_google", "fcm"
+    if platform is None:
+        reverse_platforms = {
+            value: key for key, value in DEFAULT_PROVIDER_BY_PLATFORM.items()
+        }
+        platform = reverse_platforms.get(provider)
+    if provider is None:
+        provider = DEFAULT_PROVIDER_BY_PLATFORM.get(platform)
+
+    if (platform, provider) not in SUPPORTED_PUSH_COMBINATIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="unsupported platform and push_provider combination",
+        )
+    return platform, provider
+
+
+@app.post(
+    "/api/user/update-fcm-token",
+    response_model=schemas.PushTokenRegistrationResponse,
+    summary="Register or replace the authenticated device's push token",
+    description=(
+        "Registers a provider-specific token for the authenticated device. "
+        "HarmonyOS tokens are persisted separately and are not used by FCM. "
+        "Legacy Android user_id/fcm_token payloads remain supported."
+    ),
+    responses={
+        400: {"model": schemas.ErrorResponse, "description": "Unsupported platform/provider"},
+        401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token does not own the device"},
+        404: {"model": schemas.ErrorResponse, "description": "Device not found"},
+        409: {"model": schemas.ErrorResponse, "description": "Token belongs to another device"},
+        422: {"model": schemas.ErrorResponse, "description": "Invalid request fields"},
+    },
+)
 def update_fcm_token(
     payload: schemas.UpdateFcmTokenRequest,
     current_user: models.User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if current_user.id != payload.user_id:
+    if payload.user_id is not None and current_user.id != payload.user_id:
         raise HTTPException(status_code=403, detail="not authorized for this user")
-    current_user.fcm_token = payload.fcm_token
-    db.commit()
-    return {"success": True}
+    if payload.device_id is not None and payload.device_id != current_user.device_id:
+        requested_device = (
+            db.query(models.User)
+            .filter(models.User.device_id == payload.device_id)
+            .first()
+        )
+        if requested_device is None:
+            raise HTTPException(status_code=404, detail="device not found")
+        raise HTTPException(status_code=403, detail="not authorized for this device")
+
+    platform, provider = _resolve_push_platform_provider(payload)
+    token = payload.effective_push_token
+    now = _now()
+
+    token_owner = (
+        db.query(models.DevicePushToken)
+        .filter(
+            models.DevicePushToken.push_provider == provider,
+            models.DevicePushToken.push_token == token,
+            models.DevicePushToken.user_id != current_user.id,
+        )
+        .first()
+    )
+    if token_owner is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="push token is already registered to another device",
+        )
+
+    registration = (
+        db.query(models.DevicePushToken)
+        .filter(
+            models.DevicePushToken.user_id == current_user.id,
+            models.DevicePushToken.push_provider == provider,
+        )
+        .first()
+    )
+    token_changed = registration is None or registration.push_token != token
+    registration_changed = token_changed
+    if registration is None:
+        registration = models.DevicePushToken(
+            user_id=current_user.id,
+            platform=platform,
+            push_provider=provider,
+            push_token=token,
+            push_token_updated_at=now,
+        )
+        db.add(registration)
+    elif token_changed:
+        registration.platform = platform
+        registration.push_token = token
+        registration.push_token_updated_at = now
+        registration.push_token_invalidated_at = None
+    elif registration.push_token_invalidated_at is not None:
+        registration.push_token_invalidated_at = None
+        registration.push_token_updated_at = now
+        registration_changed = True
+
+    device_status = (
+        db.query(models.DeviceStatus)
+        .filter(models.DeviceStatus.user_id == current_user.id)
+        .first()
+    )
+    status_changed = False
+    if device_status is None:
+        device_status = models.DeviceStatus(user_id=current_user.id)
+        db.add(device_status)
+        status_changed = True
+    if device_status.platform != platform:
+        device_status.platform = platform
+        status_changed = True
+    if payload.app_version is not None and device_status.app_version != payload.app_version:
+        device_status.app_version = payload.app_version
+        status_changed = True
+
+    if provider in {"harmonyos", "huawei_android"}:
+        if current_user.fcm_token is not None:
+            current_user.fcm_token = None
+            registration_changed = True
+    else:
+        if current_user.fcm_token != token:
+            current_user.fcm_token = token
+            registration_changed = True
+        if current_user.fcm_token_invalidated_at is not None:
+            current_user.fcm_token_invalidated_at = None
+            registration_changed = True
+
+    try:
+        if registration_changed or status_changed:
+            db.commit()
+        else:
+            # End the read transaction without issuing any UPDATE statements.
+            db.rollback()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="push token registration conflicted with another device",
+        ) from exc
+
+    logger.info(
+        "push token registered user_id=%s device_record_id=%s platform=%s "
+        "provider=%s token_changed=%s token_length=%s token_suffix=%s",
+        current_user.id,
+        device_status.id,
+        platform,
+        provider,
+        token_changed,
+        len(token),
+        f"***{token[-4:]}" if len(token) > 4 else "***",
+    )
+    return {
+        "success": True,
+        "registered": True,
+        "platform": platform,
+        "push_provider": provider,
+        "token_updated_at": registration.push_token_updated_at,
+        "token_changed": token_changed,
+    }
 
 
 @app.post("/api/user/unbind", response_model=schemas.SuccessResponse)
@@ -656,6 +1249,11 @@ def delete_user_data(
         (
             db.query(models.DeviceStatus)
             .filter(models.DeviceStatus.user_id == user_id)
+            .delete(synchronize_session=False)
+        )
+        (
+            db.query(models.DevicePushToken)
+            .filter(models.DevicePushToken.user_id == user_id)
             .delete(synchronize_session=False)
         )
         (
@@ -811,7 +1409,20 @@ def bind_elder(
     }
 
 
-@app.post("/api/elder/checkin", response_model=schemas.ElderCheckinResponse)
+@app.post(
+    "/api/elder/checkin",
+    response_model=schemas.ElderCheckinResponse,
+    summary="Confirm the authenticated elder is safe today",
+    description=(
+        "Requires the elder device's bearer token. Repeated submissions on the "
+        "same application-local date update and return the same daily record."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token does not own the elder ID"},
+        404: {"model": schemas.ErrorResponse, "description": "Elder not found"},
+    },
+)
 def elder_checkin(
     payload: schemas.ElderCheckinRequest,
     current_user: models.User = Depends(get_current_user),
@@ -823,14 +1434,42 @@ def elder_checkin(
     now = _now()
     local_now = _local_now()
     checkin_time = local_now.strftime("%H:%M")
-    checkin = models.DailyCheckin(
-        elder_user_id=payload.elder_user_id,
-        checkin_date=local_now.date(),
-        checkin_time=checkin_time,
-        battery_level=payload.battery_level,
-        created_at=now,
+    checkin = (
+        db.query(models.DailyCheckin)
+        .filter(
+            models.DailyCheckin.elder_user_id == payload.elder_user_id,
+            models.DailyCheckin.checkin_date == local_now.date(),
+        )
+        .first()
     )
-    db.add(checkin)
+    created_checkin = checkin is None
+    if checkin is None:
+        checkin = models.DailyCheckin(
+            elder_user_id=payload.elder_user_id,
+            checkin_date=local_now.date(),
+            checkin_time=checkin_time,
+            battery_level=payload.battery_level,
+            created_at=now,
+        )
+        db.add(checkin)
+        try:
+            db.flush()
+        except IntegrityError:
+            # A concurrent retry may have inserted the daily row after our
+            # lookup. Re-read it and apply this request as an update.
+            db.rollback()
+            created_checkin = False
+            checkin = (
+                db.query(models.DailyCheckin)
+                .filter(
+                    models.DailyCheckin.elder_user_id == payload.elder_user_id,
+                    models.DailyCheckin.checkin_date == local_now.date(),
+                )
+                .one()
+            )
+
+    checkin.checkin_time = checkin_time
+    checkin.battery_level = payload.battery_level
 
     device_status = (
         db.query(models.DeviceStatus)
@@ -849,7 +1488,7 @@ def elder_checkin(
         db.query(models.HelpRequest)
         .filter(
             models.HelpRequest.elder_user_id == payload.elder_user_id,
-            models.HelpRequest.status == "pending",
+            models.HelpRequest.status.in_(["pending", "acknowledged"]),
         )
         .all()
     )
@@ -863,27 +1502,34 @@ def elder_checkin(
         .filter(models.FamilyLink.elder_user_id == payload.elder_user_id)
         .all()
     )
-    for link in links:
-        child = db.query(models.User).filter(models.User.id == link.child_user_id).first()
-        if child is None or not child.fcm_token:
-            continue
-        data = {
-            "event_type": "checkin",
-            "child_user_id": str(link.child_user_id),
-            "elder_user_id": str(payload.elder_user_id),
-            "checkin_time": checkin_time,
-        }
-        if _send_fcm_data_notification(child.fcm_token, data):
-            logger.info("checkin FCM send success child_user_id=%s", link.child_user_id)
-        else:
-            logger.error("checkin FCM send error child_user_id=%s", link.child_user_id)
+    if created_checkin:
+        for link in links:
+            child = db.query(models.User).filter(models.User.id == link.child_user_id).first()
+            if child is None or not child.fcm_token:
+                continue
+            data = {
+                "event_type": "checkin",
+                "child_user_id": str(link.child_user_id),
+                "elder_user_id": str(payload.elder_user_id),
+                "checkin_time": checkin_time,
+            }
+            if _send_push_data_notification(db, child, data):
+                logger.info("checkin FCM send success child_user_id=%s", link.child_user_id)
+            else:
+                logger.error("checkin FCM send error child_user_id=%s", link.child_user_id)
 
     logger.info(
         "checkin elder_user_id=%s resolved_help_requests=%s",
         payload.elder_user_id,
         len(resolved_help_requests),
     )
-    return {"success": True, "message": "今日已确认平安", "checkin_time": checkin_time}
+    return {
+        "success": True,
+        "message": "今日已确认平安",
+        "checkin_time": checkin_time,
+        "checkin_id": checkin.id,
+        "checkin_date": checkin.checkin_date.isoformat(),
+    }
 
 
 @app.get(
@@ -896,10 +1542,11 @@ def elder_checkins(
     db: Session = Depends(get_db),
 ):
     _get_user_or_404(db, elder_user_id, role="elder")
+    authorized_family_link = None
     if current_user.role == "elder":
         _authorize_user(current_user, elder_user_id, "elder")
     elif current_user.role == "child":
-        linked = (
+        authorized_family_link = (
             db.query(models.FamilyLink)
             .filter(
                 models.FamilyLink.child_user_id == current_user.id,
@@ -907,7 +1554,7 @@ def elder_checkins(
             )
             .first()
         )
-        if linked is None:
+        if authorized_family_link is None:
             raise HTTPException(status_code=403, detail="family link required")
     else:
         raise HTTPException(status_code=403, detail="role is not authorized")
@@ -926,6 +1573,17 @@ def elder_checkins(
         .limit(5)
         .all()
     )
+    parent = _get_user_or_404(db, elder_user_id, role="elder")
+    if authorized_family_link is None:
+        parent_links = (
+            db.query(models.FamilyLink)
+            .filter(models.FamilyLink.elder_user_id == elder_user_id)
+            .order_by(models.FamilyLink.created_at.desc(), models.FamilyLink.id.desc())
+            .limit(2)
+            .all()
+        )
+        if len(parent_links) == 1:
+            authorized_family_link = parent_links[0]
 
     records = [
         (
@@ -953,6 +1611,16 @@ def elder_checkins(
                     "record_time": local_created_at.strftime("%H:%M"),
                     "message": record.message,
                     "battery_level": None,
+                    "alert_id": record.id,
+                    "alert_type": record.type,
+                    "status": record.status,
+                    "elder_user_id": record.elder_user_id,
+                    "parent_device_id": parent.device_id,
+                    "family_link_id": (
+                        authorized_family_link.id
+                        if authorized_family_link is not None
+                        else None
+                    ),
                 },
             )
         )
@@ -961,7 +1629,21 @@ def elder_checkins(
     return [record for _, _, record in records[:5]]
 
 
-@app.post("/api/elder/heartbeat", response_model=schemas.SuccessResponse)
+@app.post(
+    "/api/elder/heartbeat",
+    response_model=schemas.DeviceStatusUpdateResponse,
+    summary="Update the authenticated elder device status",
+    description=(
+        "Requires the elder device's bearer token. Existing Android payloads "
+        "containing only elder_user_id and battery_level remain valid. Device "
+        "metadata and a client-observed last_online timestamp are optional."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token does not own the elder ID"},
+        404: {"model": schemas.ErrorResponse, "description": "Elder not found"},
+    },
+)
 def elder_heartbeat(
     payload: schemas.ElderHeartbeatRequest,
     current_user: models.User = Depends(get_current_user),
@@ -970,6 +1652,11 @@ def elder_heartbeat(
     _authorize_user(current_user, payload.elder_user_id, "elder")
     _get_user_or_404(db, payload.elder_user_id, role="elder")
     now = _now()
+    last_online = (
+        _as_utc_naive(payload.last_online)
+        if payload.last_online is not None
+        else now
+    )
     device_status = (
         db.query(models.DeviceStatus)
         .filter(models.DeviceStatus.user_id == payload.elder_user_id)
@@ -978,14 +1665,131 @@ def elder_heartbeat(
     if device_status is None:
         device_status = models.DeviceStatus(user_id=payload.elder_user_id)
         db.add(device_status)
+    if payload.platform is not None:
+        device_status.platform = payload.platform
+        if _normalized_platform(payload.platform) in {"harmonyos", "harmony_os"}:
+            current_user.fcm_token = None
+    if payload.app_version is not None:
+        device_status.app_version = payload.app_version
+    if payload.device_uuid is not None:
+        device_status.device_uuid = payload.device_uuid
     device_status.battery_level = payload.battery_level
-    device_status.last_online_time = now
+    device_status.last_online_time = last_online
     device_status.updated_at = now
     db.commit()
     return {"success": True}
 
 
-@app.post("/api/elder/help-request", response_model=schemas.HelpRequestResponse)
+@app.get(
+    "/api/elder/current-status",
+    response_model=schemas.ParentCurrentStatusResponse,
+    summary="Get the authenticated parent device's current status",
+    description=(
+        "Requires a bearer token issued to an elder/parent registration. The "
+        "user is identified from the token; no user ID or separate "
+        "authentication mechanism is accepted. Push tokens and API secrets are "
+        "never returned."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token is not for an elder device"},
+    },
+)
+def get_parent_current_status(
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role != "elder":
+        raise HTTPException(status_code=403, detail="elder role required")
+
+    links = (
+        db.query(models.FamilyLink)
+        .filter(models.FamilyLink.elder_user_id == current_user.id)
+        .order_by(models.FamilyLink.created_at.desc(), models.FamilyLink.id.desc())
+        .all()
+    )
+    latest_checkin = (
+        db.query(models.DailyCheckin)
+        .filter(models.DailyCheckin.elder_user_id == current_user.id)
+        .order_by(models.DailyCheckin.checkin_date.desc(), models.DailyCheckin.id.desc())
+        .first()
+    )
+    device_status = (
+        db.query(models.DeviceStatus)
+        .filter(models.DeviceStatus.user_id == current_user.id)
+        .first()
+    )
+    active_help = (
+        db.query(models.HelpRequest)
+        .filter(
+            models.HelpRequest.elder_user_id == current_user.id,
+            models.HelpRequest.status.in_(["pending", "acknowledged"]),
+        )
+        .order_by(models.HelpRequest.created_at.desc(), models.HelpRequest.id.desc())
+        .first()
+    )
+
+    last_confirmation = None
+    if latest_checkin is not None:
+        last_confirmation = datetime.combine(
+            latest_checkin.checkin_date,
+            datetime.strptime(latest_checkin.checkin_time, "%H:%M").time(),
+            tzinfo=APP_TIMEZONE,
+        )
+
+    primary_link_id = links[0].id if links else None
+    return {
+        "parent_user_id": current_user.id,
+        "parent_device_id": current_user.device_id,
+        "role": current_user.role,
+        "safety_status": (
+            "normal"
+            if latest_checkin is not None
+            and latest_checkin.checkin_date == _local_now().date()
+            else "need_confirm"
+        ),
+        "last_safety_confirmation_time": last_confirmation,
+        "battery_level": device_status.battery_level if device_status else None,
+        "last_online": (
+            _as_local(device_status.last_online_time)
+            if device_status and device_status.last_online_time
+            else None
+        ),
+        "active_help_status": active_help.status if active_help else None,
+        "active_help_alert": (
+            _serialize_help_alert(active_help, current_user, primary_link_id)
+            if active_help is not None and primary_link_id is not None
+            else None
+        ),
+        "family_link_id": primary_link_id,
+        "family_link_ids": [link.id for link in links],
+        "current_family_links": [
+            {
+                "family_link_id": link.id,
+                "child_user_id": link.child_user_id,
+            }
+            for link in links
+        ],
+    }
+
+
+@app.post(
+    "/api/elder/help-request",
+    response_model=schemas.HelpRequestResponse,
+    summary="Create a stable help alert",
+    description=(
+        "Requires the elder device's bearer token and matching elder_user_id. "
+        "The response retains the legacy notification counters and adds the "
+        "stable alert identifier, type, creation time, status, and parent "
+        "identifiers. Delivery is routed to Android FCM or HarmonyOS Push "
+        "according to the child device platform."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token does not own the elder ID"},
+        404: {"model": schemas.ErrorResponse, "description": "Elder not found"},
+    },
+)
 def create_help_request(
     payload: schemas.HelpRequestCreate,
     current_user: models.User = Depends(get_current_user),
@@ -1015,6 +1819,7 @@ def create_help_request(
     )
     db.add(help_request)
     db.commit()
+    db.refresh(help_request)
 
     links = (
         db.query(models.FamilyLink)
@@ -1030,9 +1835,10 @@ def create_help_request(
         child = db.query(models.User).filter(models.User.id == link.child_user_id).first()
         has_token = bool(child and child.fcm_token)
         logger.info("help_request child_user_id=%s has_fcm_token=%s", link.child_user_id, has_token)
-        if not has_token:
+        if child is None:
             continue
-        children_with_fcm_token += 1
+        if has_token:
+            children_with_fcm_token += 1
         title = f"{link.elder_relationship} {link.elder_name} 需要帮助"
         data = {
             "event_type": "help_request",
@@ -1041,11 +1847,24 @@ def create_help_request(
             "title": title,
             "body": message,
         }
-        if _send_fcm_data_notification(child.fcm_token, data):
+        if _send_push_data_notification(
+            db,
+            child,
+            data,
+            harmony_notification=HarmonyOSNotification(
+                title="需要帮助",
+                body=message,
+                category="HEALTH",
+                event_type="help_request",
+                alert_id=help_request.id,
+                family_link_id=link.id,
+                target_page="help_alert",
+            ),
+        ):
             notified_children += 1
-            logger.info("help_request FCM send success child_user_id=%s", link.child_user_id)
+            logger.info("help_request push accepted child_user_id=%s", link.child_user_id)
         else:
-            logger.error("help_request FCM send error child_user_id=%s", link.child_user_id)
+            logger.info("help_request push not accepted child_user_id=%s", link.child_user_id)
 
     return {
         "success": True,
@@ -1053,9 +1872,107 @@ def create_help_request(
         "linked_children_count": len(links),
         "children_with_fcm_token": children_with_fcm_token,
         "notified_children": notified_children,
+        "alert_id": help_request.id,
+        "alert_type": help_request.type,
+        "created_at": help_request.created_at,
+        "status": help_request.status,
+        "elder_user_id": help_request.elder_user_id,
+        "parent_device_id": current_user.device_id,
+        "family_link_id": links[0].id if len(links) == 1 else None,
+        "family_link_ids": [link.id for link in links],
     }
 
 
+
+
+def _help_alert_for_child(
+    db: Session,
+    alert_id: int,
+    child_user_id: int,
+    current_user: models.User,
+) -> tuple[models.HelpRequest, models.FamilyLink, models.User]:
+    _authorize_user(current_user, child_user_id, "child")
+    help_request = (
+        db.query(models.HelpRequest)
+        .filter(models.HelpRequest.id == alert_id)
+        .first()
+    )
+    if help_request is None:
+        raise HTTPException(status_code=404, detail="help alert not found")
+
+    family_link = (
+        db.query(models.FamilyLink)
+        .filter(
+            models.FamilyLink.child_user_id == child_user_id,
+            models.FamilyLink.elder_user_id == help_request.elder_user_id,
+        )
+        .first()
+    )
+    if family_link is None:
+        raise HTTPException(status_code=403, detail="family link required")
+    parent = _get_user_or_404(db, help_request.elder_user_id, role="elder")
+    return help_request, family_link, parent
+
+
+ALERT_ACTION_RESPONSES = {
+    401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+    403: {"model": schemas.ErrorResponse, "description": "Child is not linked to the alert's family"},
+    404: {"model": schemas.ErrorResponse, "description": "Help alert not found"},
+}
+
+
+@app.post(
+    "/api/child/help-alerts/{alert_id}/acknowledge",
+    response_model=schemas.HelpAlertResponse,
+    summary="Acknowledge a family help alert",
+    description=(
+        "Requires the linked child device's bearer token and matching "
+        "child_user_id. Repeating the request is idempotent. Resolved alerts "
+        "remain resolved."
+    ),
+    responses=ALERT_ACTION_RESPONSES,
+)
+def acknowledge_help_alert(
+    alert_id: int,
+    payload: schemas.HelpAlertActionRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    help_request, family_link, parent = _help_alert_for_child(
+        db, alert_id, payload.child_user_id, current_user
+    )
+    if help_request.status == "pending":
+        help_request.status = "acknowledged"
+        db.commit()
+        db.refresh(help_request)
+    return _serialize_help_alert(help_request, parent, family_link.id)
+
+
+@app.post(
+    "/api/child/help-alerts/{alert_id}/resolve",
+    response_model=schemas.HelpAlertResponse,
+    summary="Resolve or clear a family help alert",
+    description=(
+        "Requires the linked child device's bearer token and matching "
+        "child_user_id. Repeating the request is idempotent. The alert record "
+        "is retained with status=resolved."
+    ),
+    responses=ALERT_ACTION_RESPONSES,
+)
+def resolve_help_alert(
+    alert_id: int,
+    payload: schemas.HelpAlertActionRequest,
+    current_user: models.User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    help_request, family_link, parent = _help_alert_for_child(
+        db, alert_id, payload.child_user_id, current_user
+    )
+    if help_request.status != "resolved":
+        help_request.status = "resolved"
+        db.commit()
+        db.refresh(help_request)
+    return _serialize_help_alert(help_request, parent, family_link.id)
 
 
 @app.post("/api/child/update-alert-settings", response_model=schemas.SuccessResponse)
@@ -1118,6 +2035,17 @@ def update_offline_alert_settings(
 @app.get(
     "/api/child/elder-status/{child_user_id}",
     response_model=list[schemas.ElderStatusResponse],
+    summary="Get statuses for the authenticated child's linked parents",
+    description=(
+        "Requires the child device's bearer token and matching child_user_id. "
+        "Every returned relationship includes its stable family_link_id; active "
+        "help alerts include stable alert fields."
+    ),
+    responses={
+        401: {"model": schemas.ErrorResponse, "description": "Missing or invalid bearer token"},
+        403: {"model": schemas.ErrorResponse, "description": "Token does not own the child ID"},
+        404: {"model": schemas.ErrorResponse, "description": "Child not found"},
+    },
 )
 def get_elder_status(
     child_user_id: int,
@@ -1155,7 +2083,7 @@ def get_elder_status(
             db.query(models.HelpRequest)
             .filter(
                 models.HelpRequest.elder_user_id == link.elder_user_id,
-                models.HelpRequest.status == "pending",
+            models.HelpRequest.status.in_(["pending", "acknowledged"]),
             )
             .order_by(models.HelpRequest.created_at.desc(), models.HelpRequest.id.desc())
             .first()
@@ -1178,9 +2106,15 @@ def get_elder_status(
                 ),
                 "pending_help_request": (
                     {
+                        "alert_id": pending_help_request.id,
+                        "alert_type": pending_help_request.type,
                         "type": pending_help_request.type,
                         "message": pending_help_request.message,
                         "created_at": pending_help_request.created_at,
+                        "status": pending_help_request.status,
+                        "elder_user_id": pending_help_request.elder_user_id,
+                        "parent_device_id": link.elder.device_id,
+                        "family_link_id": link.id,
                     }
                     if pending_help_request
                     else None

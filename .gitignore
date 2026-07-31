@@ -15,4 +15,6 @@ venv/
 
 *firebase-adminsdk*.json
 firebase-service-account.json
+*harmonyos-push-service-account*.json
 .env
+.env.local

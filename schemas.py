@@ -1,7 +1,7 @@
 from datetime import datetime, time
 from typing import Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator
+from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 from typing_extensions import Annotated
 
 
@@ -9,6 +9,9 @@ ShortText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1
 PhoneText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
 DeviceId = Annotated[str, StringConstraints(strip_whitespace=True, min_length=8, max_length=255)]
 FcmToken = Annotated[str, StringConstraints(strip_whitespace=True, min_length=16, max_length=4096)]
+PushToken = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4096)]
+PlatformText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=32)]
+AppVersionText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=64)]
 
 
 class RegisterRequest(BaseModel):
@@ -25,8 +28,50 @@ class RegisterResponse(BaseModel):
 
 
 class UpdateFcmTokenRequest(BaseModel):
-    user_id: int
-    fcm_token: FcmToken
+    user_id: int | None = Field(default=None, gt=0)
+    device_id: DeviceId | None = None
+    platform: PlatformText | None = None
+    push_provider: PlatformText | None = None
+    push_token: PushToken | None = None
+    app_version: AppVersionText | None = None
+    # Kept only for existing Android clients. It is normalized to push_token
+    # before persistence and is never treated as FCM for another provider.
+    fcm_token: PushToken | None = None
+
+    @model_validator(mode="after")
+    def validate_identity_and_token(self):
+        if self.user_id is None and self.device_id is None:
+            raise ValueError("device_id or legacy user_id is required")
+        if self.push_token is None and self.fcm_token is None:
+            raise ValueError("push_token is required")
+        if self.push_token is not None and (
+            self.device_id is None
+            or self.platform is None
+            or self.push_provider is None
+        ):
+            raise ValueError(
+                "device_id, platform, and push_provider are required with push_token"
+            )
+        if (
+            self.push_token is not None
+            and self.fcm_token is not None
+            and self.push_token != self.fcm_token
+        ):
+            raise ValueError("push_token and fcm_token must match when both are supplied")
+        return self
+
+    @property
+    def effective_push_token(self) -> str:
+        return self.push_token or self.fcm_token or ""
+
+
+class PushTokenRegistrationResponse(BaseModel):
+    success: bool
+    registered: bool
+    platform: str
+    push_provider: str
+    token_updated_at: datetime
+    token_changed: bool
 
 
 class SuccessResponse(BaseModel):
@@ -40,6 +85,15 @@ class UnbindRequest(BaseModel):
 class ElderHeartbeatRequest(BaseModel):
     elder_user_id: int
     battery_level: int = Field(ge=0, le=100)
+    platform: PlatformText | None = None
+    app_version: AppVersionText | None = None
+    role: Literal["elder"] | None = None
+    device_uuid: DeviceId | None = None
+    last_online: datetime | None = None
+
+
+class DeviceStatusUpdateResponse(BaseModel):
+    success: bool
 
 
 class UpdateAlertSettingsRequest(BaseModel):
@@ -101,6 +155,8 @@ class ElderCheckinResponse(BaseModel):
     success: bool
     message: str
     checkin_time: str
+    checkin_id: int
+    checkin_date: str
 
 
 class ElderCheckinRecordResponse(BaseModel):
@@ -109,6 +165,12 @@ class ElderCheckinRecordResponse(BaseModel):
     record_time: str
     message: str
     battery_level: int | None = None
+    alert_id: int | None = None
+    alert_type: str | None = None
+    status: str | None = None
+    elder_user_id: int | None = None
+    parent_device_id: str | None = None
+    family_link_id: int | None = None
 
 
 class HelpRequestCreate(BaseModel):
@@ -123,12 +185,62 @@ class HelpRequestResponse(BaseModel):
     linked_children_count: int = 0
     children_with_fcm_token: int = 0
     notified_children: int = 0
+    alert_id: int
+    alert_type: str
+    created_at: datetime
+    status: str
+    elder_user_id: int
+    parent_device_id: str
+    family_link_id: int | None
+    family_link_ids: list[int]
 
 
 class PendingHelpRequest(BaseModel):
+    alert_id: int
+    alert_type: str
     type: str
     message: str
     created_at: datetime
+    status: str
+    elder_user_id: int
+    parent_device_id: str
+    family_link_id: int
+
+
+class HelpAlertActionRequest(BaseModel):
+    child_user_id: int = Field(gt=0)
+
+
+class HelpAlertResponse(BaseModel):
+    alert_id: int
+    alert_type: str
+    type: str
+    message: str
+    created_at: datetime
+    status: str
+    elder_user_id: int
+    parent_device_id: str
+    family_link_id: int
+
+
+class FamilyLinkIdentifier(BaseModel):
+    family_link_id: int
+    child_user_id: int
+
+
+class ParentCurrentStatusResponse(BaseModel):
+    parent_user_id: int
+    parent_device_id: str
+    role: Literal["elder"]
+    safety_status: Literal["normal", "need_confirm"]
+    last_safety_confirmation_time: datetime | None
+    battery_level: int | None
+    last_online: datetime | None
+    active_help_status: str | None
+    active_help_alert: HelpAlertResponse | None
+    family_link_id: int | None
+    family_link_ids: list[int]
+    current_family_links: list[FamilyLinkIdentifier]
 
 
 class ElderStatusResponse(BaseModel):
@@ -153,3 +265,7 @@ class ElderStatusResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
+
+
+class ErrorResponse(BaseModel):
+    detail: str

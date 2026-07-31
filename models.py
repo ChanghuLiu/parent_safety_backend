@@ -1,4 +1,14 @@
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -17,8 +27,35 @@ class User(Base):
     phone = Column(String, nullable=False)
     device_id = Column(String, nullable=False, index=True)
     fcm_token = Column(String, nullable=True)
+    fcm_token_invalidated_at = Column(DateTime, nullable=True)
     api_token_hash = Column(String(64), nullable=True, unique=True, index=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
+
+
+class DevicePushToken(Base):
+    __tablename__ = "device_push_tokens"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "push_provider",
+            name="uq_device_push_tokens_user_provider",
+        ),
+        UniqueConstraint(
+            "push_provider",
+            "push_token",
+            name="uq_device_push_tokens_provider_token",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    platform = Column(String(32), nullable=False)
+    push_provider = Column(String(32), nullable=False)
+    push_token = Column(String(4096), nullable=False)
+    push_token_updated_at = Column(DateTime, nullable=False)
+    push_token_invalidated_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
 
 
 class DeletedApiToken(Base):
@@ -76,6 +113,14 @@ class FamilyLink(Base):
 
 class DailyCheckin(Base):
     __tablename__ = "daily_checkins"
+    __table_args__ = (
+        Index(
+            "uq_daily_checkins_elder_date",
+            "elder_user_id",
+            "checkin_date",
+            unique=True,
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     elder_user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
@@ -92,6 +137,9 @@ class DeviceStatus(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    platform = Column(String, nullable=True)
+    app_version = Column(String, nullable=True)
+    device_uuid = Column(String, nullable=True)
     battery_level = Column(Integer, nullable=True)
     last_online_time = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
