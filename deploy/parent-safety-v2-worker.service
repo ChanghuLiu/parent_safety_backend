@@ -1,0 +1,22 @@
+[Unit]
+Description=Parent Check-In V2 scheduler and notification worker
+After=network-online.target parent-safety-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/parent_safety_backend
+EnvironmentFile=/etc/parent-safety/backend.env
+Environment=V2_WORKER_EXPLICIT=true
+Environment=V2_WORKER_INTERVAL_SECONDS=60
+ExecStart=/usr/bin/flock -n /run/parent-safety/v2-worker.lock /home/ubuntu/parent_safety_backend/venv/bin/python /home/ubuntu/parent_safety_backend/scripts/run_v2_worker.py
+Restart=always
+RestartSec=5
+RuntimeDirectory=parent-safety
+RuntimeDirectoryMode=0750
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
