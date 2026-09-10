@@ -171,6 +171,8 @@ def test_v2_identity_and_parent_data_contract(v2_api):
     assert client.post("/api/v2/parents/me/check-ins", headers=parent_headers, json={"idempotency_key": "identity-checkin-1"}).status_code == 200
     deleted = client.delete("/api/v2/parents/me/data", headers=parent_headers)
     assert deleted.status_code == 200 and deleted.json()["status"] == "parent_data_deleted"
+    user_data = client.delete("/api/v2/users/me/data", headers=parent_headers)
+    assert user_data.status_code == 200 and user_data.json()["status"] == "user_data_deleted"
     parent_id = client.get(f"/api/v2/family-circles/{circle['id']}/parents", headers=organizer_headers).json()[0]["parent_profile_id"]
     assert client.get(f"/api/v2/family-circles/{circle['id']}/parents/{parent_id}/history", headers=organizer_headers).json() == []
 
@@ -215,6 +217,8 @@ def test_v2_invitation_lifecycle_and_removal(v2_api):
     assert client.post(f"/api/v2/invitations/{fresh['token']}/accept", headers=member_headers).status_code == 400
     membership_id = accepted.json()["membership_id"]
     assert client.delete(f"/api/v2/family-circles/{circle_id}/members/{membership_id}", headers=organizer_headers).status_code == 200
+    listed = client.get(f"/api/v2/family-circles/{circle_id}/members", headers=organizer_headers)
+    assert listed.status_code == 200 and all(member["membership_id"] != membership_id for member in listed.json())
     assert client.get(f"/api/v2/family-circles/{circle_id}", headers=member_headers).status_code == 403
     assert client.get(f"/api/v2/family-circles/{circle_id}").status_code == 401
 

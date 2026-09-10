@@ -154,7 +154,10 @@ def get_circle(circle_id: int, current_user: models.User = Depends(get_v2_curren
 def list_members(circle_id: int, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     _circle(db, circle_id)
     _active_membership(db, current_user.id, circle_id)
-    members = db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == circle_id).order_by(v2_models.FamilyMembership.id.asc()).all()
+    members = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.family_circle_id == circle_id,
+        v2_models.FamilyMembership.membership_status == "active",
+    ).order_by(v2_models.FamilyMembership.id.asc()).all()
     return [
         {
             "membership_id": member.id,
@@ -314,6 +317,18 @@ def delete_my_parent_data(current_user: models.User = Depends(get_v2_current_use
     db.query(v2_models.CheckInSchedule).filter(v2_models.CheckInSchedule.parent_profile_id == profile.id).delete(synchronize_session=False)
     db.commit()
     return {"success": True, "status": "parent_data_deleted"}
+
+
+@router.delete("/users/me/data", response_model=schemas.ActionResponse)
+def delete_my_user_data(current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    """Delete device and notification data while retaining the authenticated account and memberships."""
+    db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == current_user.id).delete(synchronize_session=False)
+    db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == current_user.id).delete(synchronize_session=False)
+    db.query(v2_models.V2NotificationDelivery).filter(v2_models.V2NotificationDelivery.recipient_user_id == current_user.id).delete(synchronize_session=False)
+    current_user.fcm_token = None
+    current_user.fcm_token_invalidated_at = utc_now()
+    db.commit()
+    return {"success": True, "status": "user_data_deleted"}
 
 
 @router.put("/parents/me/schedule", response_model=schemas.ScheduleResponse)
