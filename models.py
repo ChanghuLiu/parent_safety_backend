@@ -29,6 +29,9 @@ class User(Base):
     fcm_token = Column(String, nullable=True)
     fcm_token_invalidated_at = Column(DateTime, nullable=True)
     api_token_hash = Column(String(64), nullable=True, unique=True, index=True)
+    # Device-local UI/notification language.  This is deliberately attached
+    # to the authenticated user/device, never to a family relationship.
+    locale_tag = Column(String(32), nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 

@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 import models
 import schemas
+import v2_models  # noqa: F401 - registers V2 tables with the shared metadata
 from database import Base, SessionLocal, engine, get_db
 from harmonyos_push import (
     DeliveryStatus,
@@ -138,6 +139,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Additive V2 API surface. Billing and production deployment remain separate
+# later phases.
+from v2_routes import router as v2_router
+from v2_billing import router as v2_billing_router
+
+app.include_router(v2_router)
+app.include_router(v2_billing_router)
+
 
 def _ensure_sqlite_migrations():
     if engine.dialect.name != "sqlite":
@@ -158,6 +167,9 @@ def _ensure_sqlite_migrations():
         if "api_token_hash" not in column_names:
             connection.execute(sql_text("ALTER TABLE users ADD COLUMN api_token_hash VARCHAR(64)"))
             logger.info("migration added users.api_token_hash column")
+        if "locale_tag" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN locale_tag VARCHAR(32)"))
+            logger.info("migration added users.locale_tag column")
         connection.execute(
             sql_text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_api_token_hash "
