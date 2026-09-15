@@ -140,6 +140,27 @@ def test_v2_circle_parent_checkin_and_authorization(v2_api):
     assert client.get(f"/api/v2/family-circles/{other_id}/parents/{parent_id}/status", headers=other_headers).status_code in {403, 404}
 
 
+def test_android_not_well_help_alias_is_accepted_and_stored_canonically(v2_api):
+    client, database = v2_api
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "alias-organizer-device")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "alias-parent-device")
+
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Alias test"})
+    assert circle.status_code == 200
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    assert invite.status_code == 200
+    assert client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers).status_code == 200
+
+    response = client.post("/api/v2/parents/me/help-requests", headers=parent_headers, json={"request_type": "not_well"})
+    assert response.status_code == 200, response.text
+    from v2_models import V2HelpRequest
+    with database.SessionLocal() as db:
+        stored = db.query(V2HelpRequest).one()
+        assert stored.request_type == "not_feeling_well"
+
+
 def test_parent_capability_can_own_one_circle_without_losing_parent_membership(v2_api):
     client, database = v2_api
     parent, parent_headers = _register(client, "PARENT", "Parent organizer", "parent-organizer-device")

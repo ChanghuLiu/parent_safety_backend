@@ -147,8 +147,15 @@ class PushTokenRequest(BaseModel):
 
 
 class HelpRequestCreate(BaseModel):
-    request_type: Literal["call_back", "home_help", "not_feeling_well", "errand", "other"]
+    request_type: Literal["call_back", "home_help", "not_feeling_well", "not_well", "errand", "other"]
     message: str = Field(default="", max_length=500)
+
+    @field_validator("request_type", mode="before")
+    @classmethod
+    def normalize_android_help_alias(cls, value: str) -> str:
+        # Phase L Android uses the shorter stable key; keep the existing
+        # backend/storage key canonical for legacy consumers.
+        return "not_feeling_well" if value == "not_well" else value
 
 
 class HelpRequestResponse(BaseModel):
