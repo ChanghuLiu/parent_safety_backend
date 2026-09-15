@@ -101,6 +101,30 @@ class ParentProfile(Base):
     circle = sa_relationship("FamilyCircle")
 
 
+class OfflineAlertSetting(Base):
+    """V3 adapter for the proven offline/quiet/pause policy.
+
+    Legacy family_links remain the source for legacy relationships. V2 has a
+    different relationship table, so this stores the same policy fields for
+    a V2 circle without altering the legacy schema or worker semantics.
+    """
+
+    __tablename__ = "v2_offline_alert_settings"
+    __table_args__ = (UniqueConstraint("family_circle_id", name="uq_v2_offline_setting_circle"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    family_circle_id = Column(Integer, ForeignKey("v2_family_circles.id", ondelete="CASCADE"), nullable=False)
+    offline_alert_enabled = Column(Boolean, nullable=False, default=True)
+    offline_alert_hours = Column(Integer, nullable=False, default=6)
+    quiet_hours_enabled = Column(Boolean, nullable=False, default=True)
+    quiet_start_time = Column(String(5), nullable=False, default="22:00")
+    quiet_end_time = Column(String(5), nullable=False, default="07:00")
+    pause_until = Column(String, nullable=True)
+    last_alert_sent_at = Column(String, nullable=True)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class CheckInSchedule(Base):
     __tablename__ = "v2_checkin_schedules"
     __table_args__ = (

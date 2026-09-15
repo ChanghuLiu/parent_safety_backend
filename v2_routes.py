@@ -50,6 +50,17 @@ def _circle_any(db: Session, circle_id: int) -> v2_models.FamilyCircle:
     return circle
 
 
+def _offline_setting_response(setting: v2_models.OfflineAlertSetting | None) -> dict:
+    return {
+        "offline_alert_enabled": setting.offline_alert_enabled if setting else True,
+        "offline_alert_hours": setting.offline_alert_hours if setting else 6,
+        "quiet_hours_enabled": setting.quiet_hours_enabled if setting else True,
+        "quiet_start_time": setting.quiet_start_time if setting else "22:00",
+        "quiet_end_time": setting.quiet_end_time if setting else "07:00",
+        "pause_until": setting.pause_until if setting else None,
+    }
+
+
 def _parent_for_user(db: Session, user_id: int, circle_id: int | None = None) -> v2_models.ParentProfile:
     query = db.query(v2_models.ParentProfile).filter(
         v2_models.ParentProfile.user_id == user_id,
@@ -192,6 +203,51 @@ def list_members(circle_id: int, current_user: models.User = Depends(get_v2_curr
         }
         for member in members
     ]
+
+
+@router.get(
+    "/family-circles/{circle_id}/offline-alert-settings",
+    response_model=schemas.OfflineAlertSettingsResponse,
+)
+def get_offline_alert_settings(
+    circle_id: int,
+    current_user: models.User = Depends(get_v2_current_user),
+    db: Session = Depends(get_db),
+):
+    _circle_any(db, circle_id)
+    _active_membership(db, current_user.id, circle_id, ("ORGANIZER",))
+    setting = db.query(v2_models.OfflineAlertSetting).filter(
+        v2_models.OfflineAlertSetting.family_circle_id == circle_id
+    ).first()
+    return _offline_setting_response(setting)
+
+
+@router.put(
+    "/family-circles/{circle_id}/offline-alert-settings",
+    response_model=schemas.OfflineAlertSettingsResponse,
+)
+def update_offline_alert_settings_v2(
+    circle_id: int,
+    payload: schemas.OfflineAlertSettingsRequest,
+    current_user: models.User = Depends(get_v2_current_user),
+    db: Session = Depends(get_db),
+):
+    _circle_any(db, circle_id)
+    _active_membership(db, current_user.id, circle_id, ("ORGANIZER",))
+    setting = db.query(v2_models.OfflineAlertSetting).filter(
+        v2_models.OfflineAlertSetting.family_circle_id == circle_id
+    ).first()
+    if setting is None:
+        setting = v2_models.OfflineAlertSetting(family_circle_id=circle_id)
+        db.add(setting)
+    for field in (
+        "offline_alert_enabled", "offline_alert_hours", "quiet_hours_enabled",
+        "quiet_start_time", "quiet_end_time", "pause_until",
+    ):
+        setattr(setting, field, getattr(payload, field))
+    db.commit()
+    db.refresh(setting)
+    return _offline_setting_response(setting)
 
 
 @router.post("/family-circles/{circle_id}/invitations", response_model=schemas.InvitationResponse)

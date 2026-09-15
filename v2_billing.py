@@ -17,6 +17,11 @@ from v2_billing_schemas import EntitlementResponse, RtdnRequest, VerifyPurchaseR
 from v2_routes import _active_membership, _circle_any
 from v2_time import utc_now
 
+if os.getenv("APP_ENV", "production").strip().lower() not in {"production", "prod"}:
+    from v2_test_fixtures import test_entitlement_for_circle
+else:
+    test_entitlement_for_circle = None
+
 
 router = APIRouter(prefix="/api/v2", tags=["parent-check-in-billing"])
 
@@ -152,7 +157,21 @@ def get_entitlement(circle_id: int, current_user: models.User = Depends(get_v2_c
     _circle_any(db, circle_id)
     _active_membership(db, current_user.id, circle_id)
     entitlement = db.query(v2_models.PurchaseEntitlement).filter(v2_models.PurchaseEntitlement.family_circle_id == circle_id).first()
-    return _entitlement_response(entitlement) if entitlement else None
+    if entitlement is not None:
+        return _entitlement_response(entitlement)
+    if test_entitlement_for_circle is not None:
+        fixture = test_entitlement_for_circle(db, circle_id, current_user.id)
+        if fixture is not None:
+            return {
+                "family_circle_id": fixture.family_circle_id,
+                "organizer_user_id": fixture.organizer_user_id,
+                "product_id": fixture.product_id,
+                "purchase_state": "TEST",
+                "verification_state": "VERIFIED",
+                "acknowledgement_state": "ACKNOWLEDGED",
+                "updated_at": fixture.created_at,
+            }
+    return None
 
 
 def process_rtdn(payload: RtdnRequest, db: Session, verifier: GooglePlayVerifier) -> str:

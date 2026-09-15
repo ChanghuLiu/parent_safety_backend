@@ -23,6 +23,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import inspect as sqlalchemy_inspect
 from sqlalchemy import text as sql_text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -146,6 +147,10 @@ from v2_billing import router as v2_billing_router
 
 app.include_router(v2_router)
 app.include_router(v2_billing_router)
+if not IS_PRODUCTION:
+    from v2_test_fixtures import router as v2_test_fixture_router
+
+    app.include_router(v2_test_fixture_router)
 
 
 def _ensure_sqlite_migrations():
@@ -883,6 +888,53 @@ def check_offline_alerts(db: Session) -> int:
         else:
             logger.info("offline alert push not delivered child_user_id=%s elder_user_id=%s", link.child_user_id, link.elder_user_id)
 
+    if sent_count:
+        db.commit()
+    # V3 circles use their own relationship tables, but intentionally reuse
+    # the same threshold, pause, quiet-hours, and provider behavior.
+    # Older test/upgrade databases may not have received the additive V2
+    # adapter table yet; legacy offline alerts must continue to work there.
+    v2_settings = (
+        db.query(v2_models.OfflineAlertSetting).all()
+        if sqlalchemy_inspect(db.bind).has_table("v2_offline_alert_settings")
+        else []
+    )
+    for setting in v2_settings:
+        circle = db.get(v2_models.FamilyCircle, setting.family_circle_id)
+        if circle is None or circle.status.upper() != "ACTIVE" or not setting.offline_alert_enabled:
+            continue
+        parent_profile = db.query(v2_models.ParentProfile).filter(
+            v2_models.ParentProfile.family_circle_id == circle.id,
+            v2_models.ParentProfile.active.is_(True),
+        ).first()
+        if parent_profile is None:
+            continue
+        device_status = db.query(models.DeviceStatus).filter(
+            models.DeviceStatus.user_id == parent_profile.user_id
+        ).first()
+        if device_status is None or device_status.last_online_time is None:
+            continue
+        if now - device_status.last_online_time <= timedelta(hours=setting.offline_alert_hours):
+            continue
+        pause_until = _parse_datetime(setting.pause_until)
+        if pause_until is not None and now < pause_until:
+            continue
+        if setting.quiet_hours_enabled and _is_within_quiet_hours(
+            _local_now(), setting.quiet_start_time, setting.quiet_end_time
+        ):
+            continue
+        last_sent_at = _parse_datetime(setting.last_alert_sent_at)
+        if last_sent_at is not None and now - last_sent_at < timedelta(hours=12):
+            continue
+        organizer = db.get(models.User, circle.organizer_user_id)
+        if organizer is None:
+            continue
+        if _send_push_notification(
+            db, organizer, "家人长时间未在线", "可能是手机没电、关机或没有网络，请联系确认。",
+            event_type="offline_alert",
+        ):
+            setting.last_alert_sent_at = now.isoformat(timespec="seconds")
+            sent_count += 1
     if sent_count:
         db.commit()
     return sent_count

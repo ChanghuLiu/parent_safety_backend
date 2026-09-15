@@ -147,7 +147,7 @@ class PushTokenRequest(BaseModel):
 
 
 class HelpRequestCreate(BaseModel):
-    request_type: Literal["call_back", "not_feeling_well", "errand", "other"]
+    request_type: Literal["call_back", "home_help", "not_feeling_well", "errand", "other"]
     message: str = Field(default="", max_length=500)
 
 
@@ -155,6 +155,19 @@ class HelpRequestResponse(BaseModel):
     id: int
     status: str
     created_at: datetime
+
+
+class OfflineAlertSettingsRequest(BaseModel):
+    offline_alert_enabled: bool = True
+    offline_alert_hours: Literal[3, 6, 12, 24] = 6
+    quiet_hours_enabled: bool = True
+    quiet_start_time: str = Field(default="22:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    quiet_end_time: str = Field(default="07:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    pause_until: str | None = None
+
+
+class OfflineAlertSettingsResponse(OfflineAlertSettingsRequest):
+    pass
 
 
 class ActionResponse(BaseModel):
