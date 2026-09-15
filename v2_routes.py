@@ -616,6 +616,7 @@ def parent_history(circle_id: int, parent_id: int, days: int = Query(default=7, 
             "occurred_at_utc": row.occurred_at if hasattr(row, "occurred_at") else row.created_at,
             "status": row.status if hasattr(row, "status") else CheckInState.HELP_REQUESTED.value,
             "battery_level": row.battery_level if hasattr(row, "battery_level") else None,
+            "request_type": row.request_type if isinstance(row, v2_models.V2HelpRequest) else None,
         }
         for row in rows[:31]
     ]

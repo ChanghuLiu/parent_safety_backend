@@ -129,6 +129,9 @@ class HistoryItemResponse(BaseModel):
     occurred_at_utc: datetime | None
     status: str
     battery_level: int | None
+    # Optional so existing check-in history consumers remain compatible.  It
+    # is populated only for help-request rows by the history endpoint.
+    request_type: str | None = None
 
 
 class DeviceStatusRequest(BaseModel):

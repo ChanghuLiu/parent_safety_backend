@@ -161,6 +161,60 @@ def test_android_not_well_help_alias_is_accepted_and_stored_canonically(v2_api):
         assert stored.request_type == "not_feeling_well"
 
 
+@pytest.mark.parametrize(
+    ("request_type", "expected_wire_value"),
+    [
+        ("call_back", "call_back"),
+        ("home_help", "home_help"),
+        ("not_well", "not_feeling_well"),
+        ("other", "other"),
+    ],
+)
+def test_v2_history_exposes_help_request_type_and_preserves_checkin_shape(v2_api, request_type, expected_wire_value):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", f"history-organizer-{request_type}-device")
+    _, parent_headers = _register(client, "PARENT", "Parent", f"history-parent-{request_type}-device")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "History contract"})
+    assert circle.status_code == 200
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    assert invite.status_code == 200
+    assert client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers).status_code == 200
+    assert client.post("/api/v2/parents/me/check-ins", headers=parent_headers, json={"idempotency_key": f"history-checkin-{request_type}"}).status_code == 200
+    help_response = client.post("/api/v2/parents/me/help-requests", headers=parent_headers, json={"request_type": request_type})
+    assert help_response.status_code == 200, help_response.text
+
+    parent_id = client.get(f"/api/v2/family-circles/{circle_id}/parents", headers=organizer_headers).json()[0]["parent_profile_id"]
+    history = client.get(f"/api/v2/family-circles/{circle_id}/parents/{parent_id}/history", headers=organizer_headers)
+    assert history.status_code == 200, history.text
+    help_item = next(item for item in history.json() if item["request_type"] is not None)
+    assert help_item["request_type"] == expected_wire_value
+    checkin_item = next(item for item in history.json() if item["status"] == "CHECKED_IN")
+    assert checkin_item["request_type"] is None
+
+
+def test_v2_history_unknown_help_request_type_is_returned_without_serialization_failure(v2_api):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "history-unknown-organizer-device")
+    _, parent_headers = _register(client, "PARENT", "Parent", "history-unknown-parent-device")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Unknown history contract"}).json()
+    circle_id = circle["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "PARENT"}).json()
+    assert client.post(f"/api/v2/invitations/{invite['token']}/accept", headers=parent_headers).status_code == 200
+    with database.SessionLocal() as db:
+        from v2_models import ParentProfile, V2HelpRequest
+        profile = db.query(ParentProfile).filter(ParentProfile.family_circle_id == circle_id).one()
+        db.add(V2HelpRequest(family_circle_id=circle_id, parent_profile_id=profile.id, request_type="future_help_type"))
+        db.commit()
+
+    parent_id = client.get(f"/api/v2/family-circles/{circle_id}/parents", headers=organizer_headers).json()[0]["parent_profile_id"]
+    history = client.get(f"/api/v2/family-circles/{circle_id}/parents/{parent_id}/history", headers=organizer_headers)
+    assert history.status_code == 200
+    assert next(item for item in history.json() if item["request_type"] is not None)["request_type"] == "future_help_type"
+
+
 def test_parent_capability_can_own_one_circle_without_losing_parent_membership(v2_api):
     client, database = v2_api
     parent, parent_headers = _register(client, "PARENT", "Parent organizer", "parent-organizer-device")
