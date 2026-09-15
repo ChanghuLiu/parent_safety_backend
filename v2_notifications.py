@@ -63,6 +63,15 @@ def localized_message(event_type: str, locale: str, parent_name: str) -> tuple[s
             "zh-CN": ("报平安提醒", f"请提醒 {parent_name} 完成报平安。"),
             "zh-TW": ("報平安提醒", f"請提醒 {parent_name} 完成報平安。"),
         },
+        "check_now": {
+            "en": ("Check-in request", f"Please check in when you can, {parent_name}."),
+            "pt": ("Pedido de check-in", f"Por favor, confirme que está bem, {parent_name}."),
+            "pt-BR": ("Pedido de check-in", f"Por favor, confirme que está bem, {parent_name}."),
+            "es": ("Solicitud de check-in", f"Por favor, confirma que estás bien, {parent_name}."),
+            "ar": ("طلب الاطمئنان", f"يرجى تسجيل الاطمئنان عندما تستطيع، {parent_name}."),
+            "zh-CN": ("报平安请求", f"{parent_name}，方便时请报平安。"),
+            "zh-TW": ("報平安請求", f"{parent_name}，方便時請報平安。"),
+        },
     }
     return messages.get(event_type, messages["reminder"]).get(locale, messages[event_type if event_type in messages else "reminder"]["en"])
 

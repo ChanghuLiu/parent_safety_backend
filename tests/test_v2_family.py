@@ -129,6 +129,7 @@ def test_v2_circle_parent_checkin_and_authorization(v2_api):
     parents = client.get(f"/api/v2/family-circles/{circle_id}/parents", headers=organizer_headers)
     assert parents.status_code == 200 and parents.json()[0]["timezone"] == "America/Sao_Paulo"
     parent_id = parents.json()[0]["parent_profile_id"]
+    assert client.post(f"/api/v2/family-circles/{circle_id}/parents/{parent_id}/check-now", headers=organizer_headers).status_code == 200
     status = client.get(f"/api/v2/family-circles/{circle_id}/parents/{parent_id}/status", headers=sibling_headers)
     assert status.status_code == 200
     assert client.put("/api/v2/parents/me/schedule", headers=organizer_headers, json={"local_time": "10:00", "timezone": "UTC"}).status_code == 403

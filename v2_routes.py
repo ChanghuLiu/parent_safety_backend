@@ -577,6 +577,29 @@ def send_parent_reminder(circle_id: int, parent_id: int, current_user: models.Us
     return {"success": True, "status": f"queued:{queued}"}
 
 
+@router.post("/family-circles/{circle_id}/parents/{parent_id}/check-now", response_model=schemas.ActionResponse)
+def check_parent_now(circle_id: int, parent_id: int, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    _circle(db, circle_id)
+    _active_membership(db, current_user.id, circle_id, ("ORGANIZER", "FAMILY_MEMBER"))
+    profile = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.id == parent_id,
+        v2_models.ParentProfile.family_circle_id == circle_id,
+        v2_models.ParentProfile.active.is_(True),
+    ).first()
+    if profile is None:
+        raise HTTPException(status_code=404, detail="parent not found")
+    queued = queue_circle_notifications(
+        db,
+        circle_id,
+        f"check-now:{profile.id}:{current_user.id}:{utc_now().replace(second=0, microsecond=0).isoformat()}",
+        "check_now",
+        profile.display_name,
+        exclude_user_id=profile.user_id,
+    )
+    db.commit()
+    return {"success": True, "status": f"queued:{queued}"}
+
+
 @router.post("/parents/me/help-requests", response_model=schemas.HelpRequestResponse)
 def create_help_request(payload: schemas.HelpRequestCreate, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     profile = _parent_for_user(db, current_user.id)
