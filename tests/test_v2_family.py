@@ -151,7 +151,7 @@ def test_parent_capability_can_own_one_circle_without_losing_parent_membership(v
     invite = client.post(f"/api/v2/family-circles/{existing_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
     assert invite.status_code == 200
     assert client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers).status_code == 200
-    second_parent, second_parent_headers = _register(client, "PARENT", "Second parent", "second-parent-device")
+    _, second_parent_headers = _register(client, "PARENT", "Second parent", "second-parent-device")
     second_invite = client.post(f"/api/v2/family-circles/{existing_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
     assert second_invite.status_code == 200
     second_accept = client.post(f"/api/v2/invitations/{second_invite.json()['token']}/accept", headers=second_parent_headers)
@@ -176,7 +176,6 @@ def test_parent_capability_can_own_one_circle_without_losing_parent_membership(v
     circles = client.get("/api/v2/family-circles", headers=parent_headers)
     assert circles.status_code == 200
     assert {item["id"] for item in circles.json()} == {existing_id, circle["id"]}
-    assert database.SessionLocal
 
 
 def test_v2_unscheduled_checkin_is_visible_as_checked_in(v2_api):
