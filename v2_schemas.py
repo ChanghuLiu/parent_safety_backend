@@ -30,6 +30,8 @@ class V2CurrentUserResponse(BaseModel):
     role: Role
     name: str
     locale_tag: str
+    has_parent_membership: bool = False
+    has_organizer_membership: bool = False
 
 
 class CircleCreateRequest(BaseModel):
@@ -42,6 +44,7 @@ class CircleResponse(BaseModel):
     status: str
     member_count: int
     organizer_name: str
+    membership_role: str | None = None
 
 
 class MemberResponse(BaseModel):

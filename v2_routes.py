@@ -63,13 +63,28 @@ def _parent_for_user(db: Session, user_id: int, circle_id: int | None = None) ->
     return profile
 
 
-def _circle_response(db: Session, circle: v2_models.FamilyCircle) -> dict:
+def _circle_response(db: Session, circle: v2_models.FamilyCircle, viewer_user_id: int | None = None) -> dict:
     count = db.query(v2_models.FamilyMembership).filter(
         v2_models.FamilyMembership.family_circle_id == circle.id,
         v2_models.FamilyMembership.membership_status == "active",
     ).count()
     organizer = db.get(models.User, circle.organizer_user_id)
-    return {"id": circle.id, "organizer_user_id": circle.organizer_user_id, "status": circle.status, "member_count": count, "organizer_name": organizer.name if organizer else ""}
+    membership_role = None
+    if viewer_user_id is not None:
+        membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id == circle.id,
+            v2_models.FamilyMembership.user_id == viewer_user_id,
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
+        membership_role = membership.role if membership is not None else None
+    return {
+        "id": circle.id,
+        "organizer_user_id": circle.organizer_user_id,
+        "status": circle.status,
+        "member_count": count,
+        "organizer_name": organizer.name if organizer else "",
+        "membership_role": membership_role,
+    }
 
 
 @router.post("/register", response_model=schemas.V2RegisterResponse)
@@ -94,26 +109,33 @@ def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db
 
 
 @router.get("/users/me", response_model=schemas.V2CurrentUserResponse)
-def current_user_v2(current_user: models.User = Depends(get_v2_current_user)):
+def current_user_v2(current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    active_memberships = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.user_id == current_user.id,
+        v2_models.FamilyMembership.membership_status == "active",
+    ).all()
     return {
         "user_id": current_user.id,
         "role": "PARENT" if current_user.role == "parent" else "FAMILY_MEMBER",
         "name": current_user.name,
         "locale_tag": normalize_locale(current_user.locale_tag),
+        "has_parent_membership": any(membership.role == "PARENT" for membership in active_memberships),
+        "has_organizer_membership": any(membership.role == "ORGANIZER" for membership in active_memberships),
     }
 
 
 @router.post("/family-circles", response_model=schemas.CircleResponse)
 def create_circle(payload: schemas.CircleCreateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
-    if current_user.role != "family_member":
-        raise HTTPException(status_code=403, detail="only family members can organize a family circle")
     existing = db.query(v2_models.FamilyMembership).filter(
         v2_models.FamilyMembership.user_id == current_user.id,
         v2_models.FamilyMembership.role == "ORGANIZER",
         v2_models.FamilyMembership.membership_status == "active",
     ).first()
     if existing is not None:
-        raise HTTPException(status_code=409, detail="organizer already has an active family circle")
+        # Creation is idempotent at the capability boundary: switching UI
+        # context or retrying must restore the one circle this account owns.
+        existing_circle = _circle_any(db, existing.family_circle_id)
+        return _circle_response(db, existing_circle, current_user.id)
     circle = v2_models.FamilyCircle(organizer_user_id=current_user.id, status="PENDING_PURCHASE")
     db.add(circle)
     db.flush()
@@ -126,7 +148,7 @@ def create_circle(payload: schemas.CircleCreateRequest, current_user: models.Use
     ))
     db.commit()
     db.refresh(circle)
-    return _circle_response(db, circle)
+    return _circle_response(db, circle, current_user.id)
 
 
 @router.get("/family-circles", response_model=list[schemas.CircleResponse])
@@ -139,7 +161,7 @@ def list_my_circles(current_user: models.User = Depends(get_v2_current_user), db
     for membership in memberships:
         circle = db.get(v2_models.FamilyCircle, membership.family_circle_id)
         if circle is not None and circle.status.upper() != "DELETED":
-            circles.append(_circle_response(db, circle))
+            circles.append(_circle_response(db, circle, current_user.id))
     return circles
 
 
@@ -147,7 +169,7 @@ def list_my_circles(current_user: models.User = Depends(get_v2_current_user), db
 def get_circle(circle_id: int, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     circle = _circle_any(db, circle_id)
     _active_membership(db, current_user.id, circle_id)
-    return _circle_response(db, circle)
+    return _circle_response(db, circle, current_user.id)
 
 
 @router.get("/family-circles/{circle_id}/members", response_model=list[schemas.MemberResponse])
@@ -200,8 +222,8 @@ def accept_invitation(token: str, current_user: models.User = Depends(get_v2_cur
     if invitation.invited_role == "PARENT" and db.query(v2_models.ParentProfile).filter(
         v2_models.ParentProfile.family_circle_id == invitation.family_circle_id,
         v2_models.ParentProfile.active.is_(True),
-    ).count() >= 2:
-        raise HTTPException(status_code=409, detail="family circle already has the maximum of two parents")
+    ).count() >= 1:
+        raise HTTPException(status_code=409, detail="this connection already has a parent")
     if db.query(v2_models.FamilyMembership).filter(
         v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
         v2_models.FamilyMembership.user_id == current_user.id,

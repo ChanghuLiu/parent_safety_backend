@@ -139,6 +139,45 @@ def test_v2_circle_parent_checkin_and_authorization(v2_api):
     assert client.get(f"/api/v2/family-circles/{other_id}/parents/{parent_id}/status", headers=other_headers).status_code in {403, 404}
 
 
+def test_parent_capability_can_own_one_circle_without_losing_parent_membership(v2_api):
+    client, database = v2_api
+    parent, parent_headers = _register(client, "PARENT", "Parent organizer", "parent-organizer-device")
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Existing organizer", "existing-organizer-device")
+    existing = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Existing"})
+    assert existing.status_code == 200
+    existing_id = existing.json()["id"]
+    _activate_test_circle(database, existing_id)
+    invite = client.post(f"/api/v2/family-circles/{existing_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    assert invite.status_code == 200
+    assert client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers).status_code == 200
+    second_parent, second_parent_headers = _register(client, "PARENT", "Second parent", "second-parent-device")
+    second_invite = client.post(f"/api/v2/family-circles/{existing_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    assert second_invite.status_code == 200
+    second_accept = client.post(f"/api/v2/invitations/{second_invite.json()['token']}/accept", headers=second_parent_headers)
+    assert second_accept.status_code == 409
+
+    created = client.post("/api/v2/family-circles", headers=parent_headers, json={"name": "Parent-owned"})
+    assert created.status_code == 200, created.text
+    circle = created.json()
+    assert circle["organizer_user_id"] == parent["user_id"]
+    assert circle["status"] == "PENDING_PURCHASE"
+    assert circle["membership_role"] == "ORGANIZER"
+
+    current = client.get("/api/v2/users/me", headers=parent_headers)
+    assert current.status_code == 200
+    assert current.json()["has_parent_membership"] is True
+    assert current.json()["has_organizer_membership"] is True
+
+    duplicate = client.post("/api/v2/family-circles", headers=parent_headers, json={"name": "Should not create"})
+    assert duplicate.status_code == 200
+    assert duplicate.json()["id"] == circle["id"]
+
+    circles = client.get("/api/v2/family-circles", headers=parent_headers)
+    assert circles.status_code == 200
+    assert {item["id"] for item in circles.json()} == {existing_id, circle["id"]}
+    assert database.SessionLocal
+
+
 def test_v2_unscheduled_checkin_is_visible_as_checked_in(v2_api):
     client, database = v2_api
     _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "unscheduled-organizer-device")
@@ -177,11 +216,12 @@ def test_v2_identity_and_parent_data_contract(v2_api):
     assert client.get(f"/api/v2/family-circles/{circle['id']}/parents/{parent_id}/history", headers=organizer_headers).json() == []
 
 
-def test_v2_parent_cannot_create_family_circle(v2_api):
+def test_v2_parent_can_create_family_circle(v2_api):
     client, _ = v2_api
     _, parent_headers = _register(client, "PARENT", "Parent", "parent-cannot-organize")
     response = client.post("/api/v2/family-circles", headers=parent_headers, json={})
-    assert response.status_code == 403
+    assert response.status_code == 200
+    assert response.json()["status"] == "PENDING_PURCHASE"
 
 
 def test_v2_push_templates_are_recipient_localized():
