@@ -24,8 +24,10 @@ class FakeVerifier:
     def __init__(self, purchase=None):
         self.purchase = purchase or FakePurchase()
         self.acknowledged_tokens = []
+        self.get_purchase_calls = 0
 
     def get_purchase(self, purchase_token):
+        self.get_purchase_calls += 1
         return self.purchase
 
     def acknowledge(self, product_id, purchase_token):
@@ -121,19 +123,53 @@ def test_same_token_cannot_be_assigned_to_another_circle(billing_api):
     second_circle_id = circle.json()["id"]
     response = client.post("/api/v2/billing/google/verify", headers=second_headers, json=_verify_payload("shared-token", second_circle_id))
     assert response.status_code == 409
+    assert response.json()["detail"] == "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"
 
 
-def test_restore_recovers_existing_circle_and_rtdn_is_idempotent(billing_api):
+def test_original_owner_restore_is_idempotent_and_rtdn_is_idempotent(billing_api):
     client, database, verifier = billing_api
-    _, organizer_headers, circle_id = _pending_circle(client)
+    organizer, organizer_headers, circle_id = _pending_circle(client)
     token = "restore-token"
     assert client.post("/api/v2/billing/google/verify", headers=organizer_headers, json=_verify_payload(token, circle_id)).status_code == 200
 
-    new_account, new_headers = _register(client, "FAMILY_MEMBER", "Organizer device", "billing-reinstall")
-    restored = client.post("/api/v2/billing/google/restore", headers=new_headers, json=_verify_payload(token, 999999))
+    first_restore_calls = verifier.get_purchase_calls
+    restored = client.post("/api/v2/billing/google/restore", headers=organizer_headers, json=_verify_payload(token, 999999))
     assert restored.status_code == 200, restored.text
     assert restored.json()["family_circle_id"] == circle_id
-    assert restored.json()["organizer_user_id"] == new_account["user_id"]
+    assert restored.json()["organizer_user_id"] == organizer["user_id"]
+    repeated = client.post("/api/v2/billing/google/restore", headers=organizer_headers, json=_verify_payload(token, 999999))
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["organizer_user_id"] == organizer["user_id"]
+    assert verifier.get_purchase_calls == first_restore_calls + 2
+
+    with database.SessionLocal() as db:
+        from v2_models import FamilyCircle, FamilyMembership, PurchaseEntitlement
+        circle = db.get(FamilyCircle, circle_id)
+        entitlement = db.query(PurchaseEntitlement).one()
+        assert circle.organizer_user_id == organizer["user_id"]
+        assert entitlement.organizer_user_id == organizer["user_id"]
+        assert entitlement.purchase_state == "PURCHASED"
+        assert entitlement.verification_state == "VERIFIED"
+        assert entitlement.acknowledgement_state == "ACKNOWLEDGED"
+        assert db.query(FamilyCircle).count() == 1
+        assert db.query(PurchaseEntitlement).count() == 1
+        assert db.query(FamilyMembership).filter(FamilyMembership.role == "ORGANIZER").count() == 1
+
+    _, other_headers = _register(client, "FAMILY_MEMBER", "Other device", "billing-reinstall")
+    calls_before_cross_account_restore = verifier.get_purchase_calls
+    cross_account = client.post("/api/v2/billing/google/restore", headers=other_headers, json=_verify_payload(token, 999999))
+    assert cross_account.status_code == 409
+    assert cross_account.json()["detail"] == "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"
+    assert verifier.get_purchase_calls == calls_before_cross_account_restore
+
+    with database.SessionLocal() as db:
+        from v2_models import FamilyCircle, FamilyMembership, PurchaseEntitlement
+        circle = db.get(FamilyCircle, circle_id)
+        entitlement = db.query(PurchaseEntitlement).one()
+        assert circle.organizer_user_id == organizer["user_id"]
+        assert entitlement.organizer_user_id == organizer["user_id"]
+        assert db.query(FamilyMembership).filter(FamilyMembership.user_id == organizer["user_id"], FamilyMembership.role == "ORGANIZER").count() == 1
+        assert db.query(FamilyMembership).filter(FamilyMembership.user_id != organizer["user_id"], FamilyMembership.role == "ORGANIZER").count() == 0
 
     verifier.purchase.purchase_state = "CANCELED"
     import v2_billing
@@ -151,3 +187,29 @@ def test_restore_recovers_existing_circle_and_rtdn_is_idempotent(billing_api):
         from v2_models import FamilyCircle, PurchaseEntitlement
         assert db.get(FamilyCircle, circle_id).status == "SUSPENDED"
         assert db.query(PurchaseEntitlement).one().verification_state == "INVALID"
+
+
+def test_cross_account_restore_does_not_mutate_existing_entitlement(billing_api):
+    client, database, verifier = billing_api
+    original, original_headers, circle_id = _pending_circle(client)
+    token = "cross-account-restore-token"
+    assert client.post("/api/v2/billing/google/verify", headers=original_headers, json=_verify_payload(token, circle_id)).status_code == 200
+    _, other_headers = _register(client, "FAMILY_MEMBER", "Other", "cross-account-device")
+    calls_before = verifier.get_purchase_calls
+
+    response = client.post("/api/v2/billing/google/restore", headers=other_headers, json=_verify_payload(token, 123456))
+    assert response.status_code == 409
+    assert response.json() == {"detail": "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"}
+    assert verifier.get_purchase_calls == calls_before
+
+    with database.SessionLocal() as db:
+        from v2_models import FamilyCircle, FamilyMembership, PurchaseEntitlement
+        circle = db.get(FamilyCircle, circle_id)
+        entitlement = db.query(PurchaseEntitlement).one()
+        assert circle.organizer_user_id == original["user_id"]
+        assert entitlement.organizer_user_id == original["user_id"]
+        assert entitlement.purchase_state == "PURCHASED"
+        assert entitlement.verification_state == "VERIFIED"
+        assert entitlement.acknowledgement_state == "ACKNOWLEDGED"
+        assert db.query(FamilyMembership).filter(FamilyMembership.family_circle_id == circle_id, FamilyMembership.user_id == original["user_id"], FamilyMembership.role == "ORGANIZER").count() == 1
+        assert db.query(FamilyMembership).filter(FamilyMembership.family_circle_id == circle_id, FamilyMembership.user_id != original["user_id"], FamilyMembership.role == "ORGANIZER").count() == 0

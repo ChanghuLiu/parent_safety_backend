@@ -20,6 +20,8 @@ from v2_time import utc_now
 
 router = APIRouter(prefix="/api/v2", tags=["parent-check-in-billing"])
 
+PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT = "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"
+
 
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -47,6 +49,11 @@ def _verify_and_apply(payload: VerifyPurchaseRequest, current_user: models.User,
         raise HTTPException(status_code=400, detail="unexpected product")
     token_hash = _token_hash(payload.purchase_token)
     existing = db.query(v2_models.PurchaseEntitlement).filter(v2_models.PurchaseEntitlement.purchase_token_hash == token_hash).first()
+    if existing is not None and existing.organizer_user_id != current_user.id:
+        # A Play account can be present on more than one backend account.  An
+        # already-bound purchase is not transferable merely because the token
+        # was returned by Google for this device/account.
+        raise HTTPException(status_code=409, detail=PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT)
     if payload.family_circle_id is not None:
         circle = _circle_any(db, payload.family_circle_id)
         membership = _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
@@ -103,15 +110,6 @@ def _verify_and_apply(payload: VerifyPurchaseRequest, current_user: models.User,
             existing.acknowledgement_state = "ACKNOWLEDGED"
         existing.last_verified_at = utc_now()
         existing.purchased_at = existing.purchased_at or purchase.purchased_at
-        if payload.family_circle_id is None and existing.organizer_user_id != current_user.id:
-            # Reinstall/second-device recovery is only possible after the
-            # server has re-verified the already-owned Play token.
-            existing.organizer_user_id = current_user.id
-            circle = _circle_any(db, existing.family_circle_id)
-            circle.organizer_user_id = current_user.id
-            if db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == circle.id, v2_models.FamilyMembership.user_id == current_user.id).first() is None:
-                db.add(v2_models.FamilyMembership(family_circle_id=circle.id, user_id=current_user.id, role="ORGANIZER", relationship="organizer", membership_status="active"))
-
     circle = _circle_any(db, existing.family_circle_id)
     if purchase_state == "PURCHASED":
         existing.verification_state = "VERIFIED"
