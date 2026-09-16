@@ -12,7 +12,7 @@ import v2_models
 import v2_schemas as schemas
 from database import get_db
 from v2_auth import get_v2_current_user
-from v2_notifications import normalize_locale, queue_circle_notifications
+from v2_notifications import normalize_locale, queue_circle_notifications, queue_recipient_notification
 from v2_time import CheckInState, as_utc, checkin_result, evaluate_schedule, localize_utc, next_scheduled_window, utc_now
 
 
@@ -787,7 +787,13 @@ def send_parent_reminder(circle_id: int, parent_id: int, current_user: models.Us
     profile = db.query(v2_models.ParentProfile).filter(v2_models.ParentProfile.id == parent_id, v2_models.ParentProfile.family_circle_id == circle_id, v2_models.ParentProfile.active.is_(True)).first()
     if profile is None:
         raise HTTPException(status_code=404, detail="parent not found")
-    queued = queue_circle_notifications(db, circle_id, f"reminder:{profile.id}:{current_user.id}:{utc_now().replace(second=0, microsecond=0).isoformat()}", "reminder", profile.display_name, exclude_user_id=profile.user_id)
+    queued = queue_recipient_notification(
+        db,
+        f"reminder:{profile.id}:{current_user.id}:{utc_now().replace(second=0, microsecond=0).isoformat()}",
+        profile.user_id,
+        "reminder",
+        profile.display_name,
+    )
     db.commit()
     return {"success": True, "status": f"queued:{queued}"}
 
@@ -803,13 +809,12 @@ def check_parent_now(circle_id: int, parent_id: int, current_user: models.User =
     ).first()
     if profile is None:
         raise HTTPException(status_code=404, detail="parent not found")
-    queued = queue_circle_notifications(
+    queued = queue_recipient_notification(
         db,
-        circle_id,
         f"check-now:{profile.id}:{current_user.id}:{utc_now().replace(second=0, microsecond=0).isoformat()}",
+        profile.user_id,
         "check_now",
         profile.display_name,
-        exclude_user_id=profile.user_id,
     )
     db.commit()
     return {"success": True, "status": f"queued:{queued}"}

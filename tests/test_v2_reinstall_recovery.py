@@ -122,3 +122,20 @@ def test_pending_recovery_cannot_join_another_circle(v2_api):
     replacement_headers = {"Authorization": f"Bearer {fresh['api_token']}"}
     blocked = client.post(f"/api/v2/invitations/{invite2['token']}/accept", headers=replacement_headers)
     assert blocked.status_code == 403
+
+
+def test_reminder_and_check_now_target_parent_after_recovery(v2_api):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "push-organizer-device")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "push-parent-device")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Push target"}).json()
+    _activate_test_circle(database, circle["id"])
+    invite = client.post(f"/api/v2/family-circles/{circle['id']}/invitations", headers=organizer_headers, json={"role": "PARENT"}).json()
+    assert client.post(f"/api/v2/invitations/{invite['token']}/accept", headers=parent_headers).status_code == 200
+    parent_profile_id = client.get(f"/api/v2/family-circles/{circle['id']}/parents", headers=organizer_headers).json()[0]["parent_profile_id"]
+    assert client.post(f"/api/v2/family-circles/{circle['id']}/parents/{parent_profile_id}/reminders", headers=organizer_headers).status_code == 200
+    assert client.post(f"/api/v2/family-circles/{circle['id']}/parents/{parent_profile_id}/check-now", headers=organizer_headers).status_code == 200
+    with database.SessionLocal() as db:
+        from v2_models import V2NotificationDelivery
+        deliveries = db.query(V2NotificationDelivery).order_by(V2NotificationDelivery.id.asc()).all()
+        assert {delivery.recipient_user_id for delivery in deliveries} == {parent["user_id"]}
