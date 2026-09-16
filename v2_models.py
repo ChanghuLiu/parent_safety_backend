@@ -95,6 +95,9 @@ class ParentProfile(Base):
     display_name = Column(String(100), nullable=False)
     timezone = Column(String(64), nullable=False, default="UTC")
     active = Column(Boolean, nullable=False, default=True, index=True)
+    # Links replacement history without moving historical events away from
+    # the original Parent profile.
+    recovered_from_parent_profile_id = Column(Integer, nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
 
     user = sa_relationship("User")

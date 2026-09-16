@@ -1,6 +1,7 @@
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.exc import IntegrityError
@@ -102,8 +103,62 @@ def _circle_response(db: Session, circle: v2_models.FamilyCircle, viewer_user_id
 def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db)):
     role = "parent" if payload.role == "PARENT" else "family_member"
     existing = db.query(models.User).filter(models.User.device_id == payload.device_id, models.User.role == role).first()
+    if existing is not None and role == "parent":
+        # A reinstall must not receive the old account's token.  Create or
+        # reuse a pending identity that can only become active through an
+        # invitation from the original circle organizer.
+        pending = db.query(models.User).filter(
+            models.User.role == "parent",
+            models.User.recovery_device_id == payload.device_id,
+        ).order_by(models.User.id.desc()).first()
+        active_membership = None
+        if pending is not None:
+            active_membership = db.query(v2_models.FamilyMembership).filter(
+                v2_models.FamilyMembership.user_id == pending.id,
+                v2_models.FamilyMembership.membership_status == "active",
+            ).first()
+        if pending is None or active_membership is not None:
+            pending = models.User(
+                role=role,
+                name=payload.name,
+                phone=payload.phone,
+                # Keep the protected physical-device owner unique.  This
+                # placeholder is replaced only after authorized recovery.
+                device_id=f"pending-parent-{uuid4().hex}",
+                recovery_device_id=payload.device_id,
+                api_token_hash=None,
+                locale_tag=normalize_locale(payload.locale_tag),
+            )
+            db.add(pending)
+        else:
+            pending.name = payload.name
+            pending.phone = payload.phone
+            pending.locale_tag = normalize_locale(payload.locale_tag)
+        raw_token = secrets.token_urlsafe(32)
+        pending.api_token_hash = _hash(raw_token)
+        db.commit()
+        db.refresh(pending)
+        return {"user_id": pending.id, "role": payload.role, "api_token": raw_token, "locale_tag": pending.locale_tag}
     if existing is not None:
         raise HTTPException(status_code=409, detail="device is already registered for this role")
+    pending = db.query(models.User).filter(
+        models.User.role == role,
+        models.User.recovery_device_id == payload.device_id,
+    ).order_by(models.User.id.desc()).first()
+    if pending is not None:
+        active_membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.user_id == pending.id,
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
+        if active_membership is None:
+            raw_token = secrets.token_urlsafe(32)
+            pending.name = payload.name
+            pending.phone = payload.phone
+            pending.locale_tag = normalize_locale(payload.locale_tag)
+            pending.api_token_hash = _hash(raw_token)
+            db.commit()
+            db.refresh(pending)
+            return {"user_id": pending.id, "role": payload.role, "api_token": raw_token, "locale_tag": pending.locale_tag}
     raw_token = secrets.token_urlsafe(32)
     user = models.User(
         role=role,
@@ -273,8 +328,103 @@ def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, 
 @router.post("/invitations/{token}/accept", response_model=schemas.InvitationAcceptResponse)
 def accept_invitation(token: str, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     invitation = db.query(v2_models.FamilyInvitation).filter(v2_models.FamilyInvitation.token_hash == _hash(token)).first()
+    if invitation is not None and invitation.status == "accepted" and invitation.accepted_by_user_id == current_user.id:
+        membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
+            v2_models.FamilyMembership.user_id == current_user.id,
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
+        profile = db.query(v2_models.ParentProfile).filter(
+            v2_models.ParentProfile.family_circle_id == invitation.family_circle_id,
+            v2_models.ParentProfile.user_id == current_user.id,
+            v2_models.ParentProfile.active.is_(True),
+        ).first()
+        if membership is not None and profile is not None and profile.recovered_from_parent_profile_id is not None:
+            return {"membership_id": membership.id, "family_circle_id": invitation.family_circle_id, "role": invitation.invited_role, "parent_profile_id": profile.id if profile else None}
     if invitation is None or invitation.status != "pending" or invitation.expires_at < utc_now():
         raise HTTPException(status_code=400, detail="invalid or expired invitation")
+    if current_user.recovery_device_id is not None and invitation.invited_role != "PARENT":
+        raise HTTPException(status_code=403, detail="parent recovery requires a Parent invitation")
+    if invitation.invited_role == "PARENT" and current_user.recovery_device_id is not None:
+        # A reinstall-created identity can only be recovered into the circle
+        # that owns the protected device.  It cannot be used to join another
+        # circle as a normal Parent.
+        old_user = db.query(models.User).filter(
+            models.User.role == "parent",
+            models.User.device_id == current_user.recovery_device_id,
+        ).first()
+        if old_user is None:
+            raise HTTPException(status_code=409, detail="parent recovery is unavailable")
+        if db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.user_id == current_user.id,
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first() is not None:
+            raise HTTPException(status_code=409, detail="parent recovery requires an unpaired identity")
+        if invitation.invited_by_user_id == current_user.id:
+            raise HTTPException(status_code=403, detail="parent recovery requires the family organizer")
+        old_profiles = db.query(v2_models.ParentProfile).filter(
+            v2_models.ParentProfile.user_id == old_user.id,
+            v2_models.ParentProfile.active.is_(True),
+        ).all()
+        if len(old_profiles) != 1 or old_profiles[0].family_circle_id != invitation.family_circle_id:
+            raise HTTPException(status_code=403, detail="parent recovery requires the original family circle")
+        organizer_membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
+            v2_models.FamilyMembership.user_id == invitation.invited_by_user_id,
+            v2_models.FamilyMembership.role == "ORGANIZER",
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
+        if organizer_membership is None:
+            raise HTTPException(status_code=403, detail="invitation organizer is not active")
+        old_profile = old_profiles[0]
+        old_membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
+            v2_models.FamilyMembership.user_id == old_user.id,
+            v2_models.FamilyMembership.role == "PARENT",
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
+        if old_membership is None:
+            raise HTTPException(status_code=409, detail="parent recovery requires an active original parent")
+        now = utc_now()
+        # Move the protected owner to an audit-only tombstone before assigning
+        # the physical identifier to the replacement.  This preserves the old
+        # user/profile/history without leaving two active device owners.
+        old_membership.membership_status = "replaced"
+        old_profile.active = False
+        old_user.api_token_hash = None
+        old_user.fcm_token = None
+        old_user.fcm_token_invalidated_at = now
+        old_user.device_id = f"replaced-parent-{old_user.id}-{uuid4().hex}"
+        for old_token in db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == old_user.id).all():
+            old_token.push_token_invalidated_at = now
+        db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == old_user.id).delete(synchronize_session=False)
+        current_user.device_id = current_user.recovery_device_id
+        current_user.recovery_device_id = None
+        membership = v2_models.FamilyMembership(
+            family_circle_id=invitation.family_circle_id,
+            user_id=current_user.id,
+            role="PARENT",
+            relationship=invitation.invited_relationship,
+            membership_status="active",
+        )
+        db.add(membership)
+        db.flush()
+        parent_profile = v2_models.ParentProfile(
+            user_id=current_user.id,
+            family_circle_id=invitation.family_circle_id,
+            display_name=current_user.name,
+            timezone=old_profile.timezone,
+            active=True,
+            recovered_from_parent_profile_id=old_profile.id,
+        )
+        db.add(parent_profile)
+        invitation.status = "accepted"
+        invitation.accepted_by_user_id = current_user.id
+        invitation.accepted_at = now
+        db.commit()
+        db.refresh(membership)
+        db.refresh(parent_profile)
+        return {"membership_id": membership.id, "family_circle_id": invitation.family_circle_id, "role": invitation.invited_role, "parent_profile_id": parent_profile.id}
     if invitation.invited_role == "PARENT" and db.query(v2_models.ParentProfile).filter(
         v2_models.ParentProfile.family_circle_id == invitation.family_circle_id,
         v2_models.ParentProfile.active.is_(True),
@@ -604,9 +754,17 @@ def parent_history(circle_id: int, parent_id: int, days: int = Query(default=7, 
     profile = db.query(v2_models.ParentProfile).filter(v2_models.ParentProfile.id == parent_id, v2_models.ParentProfile.family_circle_id == circle_id, v2_models.ParentProfile.active.is_(True)).first()
     if profile is None:
         raise HTTPException(status_code=404, detail="parent not found")
+    profile_ids = [profile.id]
+    predecessor_id = profile.recovered_from_parent_profile_id
+    while predecessor_id is not None and predecessor_id not in profile_ids:
+        predecessor = db.get(v2_models.ParentProfile, predecessor_id)
+        if predecessor is None or predecessor.family_circle_id != circle_id:
+            break
+        profile_ids.append(predecessor.id)
+        predecessor_id = predecessor.recovered_from_parent_profile_id
     local_today = localize_utc(utc_now(), profile.timezone).date()
-    events = db.query(v2_models.CheckInEvent).filter(v2_models.CheckInEvent.parent_profile_id == profile.id, v2_models.CheckInEvent.local_date >= local_today - timedelta(days=days - 1)).order_by(v2_models.CheckInEvent.local_date.desc(), v2_models.CheckInEvent.scheduled_for_utc.desc()).limit(31).all()
-    help_requests = db.query(v2_models.V2HelpRequest).filter(v2_models.V2HelpRequest.parent_profile_id == profile.id, v2_models.V2HelpRequest.created_at >= utc_now() - timedelta(days=days)).order_by(v2_models.V2HelpRequest.created_at.desc()).limit(31).all()
+    events = db.query(v2_models.CheckInEvent).filter(v2_models.CheckInEvent.parent_profile_id.in_(profile_ids), v2_models.CheckInEvent.local_date >= local_today - timedelta(days=days - 1)).order_by(v2_models.CheckInEvent.local_date.desc(), v2_models.CheckInEvent.scheduled_for_utc.desc()).limit(31).all()
+    help_requests = db.query(v2_models.V2HelpRequest).filter(v2_models.V2HelpRequest.parent_profile_id.in_(profile_ids), v2_models.V2HelpRequest.created_at >= utc_now() - timedelta(days=days)).order_by(v2_models.V2HelpRequest.created_at.desc()).limit(31).all()
     rows = [*events, *help_requests]
     rows.sort(key=lambda row: getattr(row, "occurred_at", None) or getattr(row, "created_at", None), reverse=True)
     return [
@@ -720,6 +878,18 @@ def register_push_token(payload: schemas.PushTokenRequest, current_user: models.
         current_user.fcm_token = payload.push_token
         current_user.fcm_token_invalidated_at = None
     token = db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == current_user.id, models.DevicePushToken.push_provider == provider).first()
+    token_by_value = db.query(models.DevicePushToken).filter(
+        models.DevicePushToken.push_provider == provider,
+        models.DevicePushToken.push_token == payload.push_token,
+    ).first()
+    if token_by_value is not None and token_by_value.user_id != current_user.id:
+        if token_by_value.push_token_invalidated_at is None:
+            raise HTTPException(status_code=409, detail="push token is active for another account")
+        if token is None:
+            token = token_by_value
+            token.user_id = current_user.id
+        else:
+            token_by_value.push_token = f"invalidated-{token_by_value.id}-{uuid4().hex}"
     if token is None:
         token = models.DevicePushToken(user_id=current_user.id, push_provider=provider, push_token=payload.push_token, platform=payload.platform, push_token_updated_at=utc_now())
         db.add(token)

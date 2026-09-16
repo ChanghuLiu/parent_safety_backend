@@ -26,6 +26,10 @@ class User(Base):
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False)
     device_id = Column(String, nullable=False, index=True)
+    # A reinstall-created Parent identity is intentionally unpaired until the
+    # original circle organizer authorizes recovery through an invitation.
+    # It is never used as an authentication or ownership credential by itself.
+    recovery_device_id = Column(String, nullable=True, index=True)
     fcm_token = Column(String, nullable=True)
     fcm_token_invalidated_at = Column(DateTime, nullable=True)
     api_token_hash = Column(String(64), nullable=True, unique=True, index=True)

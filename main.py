@@ -175,12 +175,41 @@ def _ensure_sqlite_migrations():
         if "locale_tag" not in column_names:
             connection.execute(sql_text("ALTER TABLE users ADD COLUMN locale_tag VARCHAR(32)"))
             logger.info("migration added users.locale_tag column")
+        if "recovery_device_id" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN recovery_device_id VARCHAR"))
+            logger.info("migration added users.recovery_device_id column")
+        connection.execute(
+            sql_text(
+                "CREATE INDEX IF NOT EXISTS ix_users_recovery_device_id "
+                "ON users(recovery_device_id)"
+            )
+        )
         connection.execute(
             sql_text(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_api_token_hash "
                 "ON users(api_token_hash) WHERE api_token_hash IS NOT NULL"
             )
         )
+        parent_profile_columns = connection.execute(
+            sql_text("PRAGMA table_info(v2_parent_profiles)")
+        ).fetchall()
+        if parent_profile_columns:
+            parent_profile_column_names = {column[1] for column in parent_profile_columns}
+            if "recovered_from_parent_profile_id" not in parent_profile_column_names:
+                connection.execute(
+                    sql_text(
+                        "ALTER TABLE v2_parent_profiles "
+                        "ADD COLUMN recovered_from_parent_profile_id INTEGER"
+                    )
+                )
+                logger.info("migration added v2_parent_profiles.recovered_from_parent_profile_id column")
+            connection.execute(
+                sql_text(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_v2_parent_profiles_recovered_from_parent_profile_id "
+                    "ON v2_parent_profiles(recovered_from_parent_profile_id)"
+                )
+            )
         connection.execute(
             sql_text(
                 """
