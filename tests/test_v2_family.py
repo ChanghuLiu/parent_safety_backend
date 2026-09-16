@@ -21,12 +21,14 @@ def v2_api(tmp_path, monkeypatch):
     import fastapi.routing
     import models
     import v2_models
+    import v2_auth
     import v2_routes
     import main
 
     importlib.reload(database)
     importlib.reload(models)
     importlib.reload(v2_models)
+    importlib.reload(v2_auth)
     importlib.reload(v2_routes)
     importlib.reload(main)
     main.Base.metadata.create_all(bind=main.engine)
@@ -40,6 +42,11 @@ def v2_api(tmp_path, monkeypatch):
             db.close()
 
     main.app.dependency_overrides[main.get_db] = isolated_db
+    # V2 route and auth dependencies keep their imported get_db references.
+    # Override those references too so every request in the isolated harness
+    # uses the same temporary database/session.
+    main.app.dependency_overrides[v2_routes.get_db] = isolated_db
+    main.app.dependency_overrides[v2_auth.get_db] = isolated_db
 
     async def run_inline(function, *args, **kwargs):
         return function(*args, **kwargs)

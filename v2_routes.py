@@ -526,7 +526,15 @@ def delete_my_v2_account(current_user: models.User = Depends(get_v2_current_user
     db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.user_id == current_user.id).update({"membership_status": "deleted"}, synchronize_session=False)
     db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == current_user.id).delete(synchronize_session=False)
     db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == current_user.id).delete(synchronize_session=False)
-    current_user.invalidated_at = utc_now()
+    db.query(v2_models.V2NotificationDelivery).filter(
+        v2_models.V2NotificationDelivery.recipient_user_id == current_user.id
+    ).delete(synchronize_session=False)
+    # Keep the user as an audit tombstone while invalidating every
+    # authentication and notification credential.  User has no generic
+    # `invalidated_at` column; this existing field is the account's FCM
+    # invalidation marker and is also used by the token-registration flow.
+    current_user.fcm_token = None
+    current_user.fcm_token_invalidated_at = utc_now()
     current_user.api_token_hash = None
     current_user.name = "Deleted user"
     current_user.phone = ""
