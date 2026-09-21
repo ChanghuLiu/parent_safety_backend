@@ -4,6 +4,7 @@ import hashlib
 import os
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 import models
@@ -49,46 +50,119 @@ def _entitlement_response(entitlement: v2_models.PurchaseEntitlement) -> dict:
     }
 
 
-def _verify_and_apply(payload: VerifyPurchaseRequest, current_user: models.User, db: Session, verifier: GooglePlayVerifier) -> dict:
-    if payload.product_id != PRODUCT_ID:
-        raise HTTPException(status_code=400, detail="unexpected product")
-    token_hash = _token_hash(payload.purchase_token)
-    existing = db.query(v2_models.PurchaseEntitlement).filter(v2_models.PurchaseEntitlement.purchase_token_hash == token_hash).first()
-    if existing is not None and existing.organizer_user_id != current_user.id:
-        # A Play account can be present on more than one backend account.  An
-        # already-bound purchase is not transferable merely because the token
-        # was returned by Google for this device/account.
-        raise HTTPException(status_code=409, detail=PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT)
-    if payload.family_circle_id is not None:
-        circle = _circle_any(db, payload.family_circle_id)
-        membership = _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
-        del membership
-        if existing is not None and existing.family_circle_id != circle.id:
-            raise HTTPException(status_code=409, detail="purchase is already assigned to another family circle")
-        if existing is None and circle.status != "PENDING_PURCHASE":
-            raise HTTPException(status_code=409, detail="family circle is not awaiting purchase")
-    elif existing is None:
-        raise HTTPException(status_code=404, detail="purchase is not associated with a family circle")
+def _restore_circle_for_user(db: Session, current_user: models.User) -> v2_models.FamilyCircle:
+    """Resolve the only server-authorized caregiver target for a restore.
 
+    Restore deliberately does not accept a client-supplied circle as proof of
+    ownership.  A caregiver with no circle receives the same pending circle
+    that the normal Connect Parent flow expects, after Google verification has
+    succeeded.
+    """
+    if current_user.role != "family_member":
+        raise HTTPException(status_code=403, detail="only a caregiver can restore a family purchase")
+    memberships = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.user_id == current_user.id,
+        v2_models.FamilyMembership.role == "ORGANIZER",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).all()
+    if len(memberships) > 1:
+        raise HTTPException(status_code=409, detail="multiple family circles require explicit selection")
+    if memberships:
+        return _circle_any(db, memberships[0].family_circle_id)
+    circle = v2_models.FamilyCircle(organizer_user_id=current_user.id, status="PENDING_PURCHASE")
+    db.add(circle)
+    db.flush()
+    db.add(v2_models.FamilyMembership(
+        family_circle_id=circle.id,
+        user_id=current_user.id,
+        role="ORGANIZER",
+        relationship="organizer",
+        membership_status="active",
+    ))
+    db.flush()
+    return circle
+
+
+def _audit_restore(
+    db: Session,
+    current_user: models.User,
+    entitlement: v2_models.PurchaseEntitlement,
+    token_hash: str,
+    result: str,
+) -> None:
+    db.add(v2_models.BillingAuditEvent(
+        event_type="google_purchase_restore",
+        source="verified_orphan_recovery",
+        user_id=current_user.id,
+        entitlement_id=entitlement.id,
+        family_circle_id=entitlement.family_circle_id,
+        product_id=PRODUCT_ID,
+        purchase_token_hash=token_hash,
+        result=result,
+    ))
+
+
+def _verify_and_apply(
+    payload: VerifyPurchaseRequest,
+    current_user: models.User,
+    db: Session,
+    verifier: GooglePlayVerifier,
+    *,
+    restore: bool = False,
+) -> dict:
+    # Google verification is intentionally the first ownership-sensitive
+    # operation.  An unknown token must never be rejected locally before the
+    # Play Developer API has established what was purchased.
     try:
         purchase = verifier.get_purchase(payload.purchase_token)
     except Exception as exc:
         raise HTTPException(status_code=502, detail="Google Play verification unavailable") from exc
     if purchase.package_name != PACKAGE_NAME or purchase.product_id != PRODUCT_ID:
         raise HTTPException(status_code=400, detail="purchase does not match this application")
+    if payload.product_id != PRODUCT_ID:
+        raise HTTPException(status_code=400, detail="unexpected product")
     if purchase.obfuscated_account_id and payload.obfuscated_account_id and purchase.obfuscated_account_id != payload.obfuscated_account_id:
-        raise HTTPException(status_code=403, detail="purchase attribution mismatch")
-    if existing is not None and existing.obfuscated_account_hash and purchase.obfuscated_account_id and _token_hash(purchase.obfuscated_account_id) != existing.obfuscated_account_hash:
         raise HTTPException(status_code=403, detail="purchase attribution mismatch")
     purchase_state = _state(purchase.purchase_state)
     if purchase_state not in {"PENDING", "PURCHASED", "CANCELED", "CANCELLED"}:
         purchase_state = "INVALID"
+    if restore and purchase_state != "PURCHASED":
+        raise HTTPException(status_code=400, detail="purchase is not currently purchased")
+
+    token_hash = _token_hash(payload.purchase_token)
+    existing = db.query(v2_models.PurchaseEntitlement).filter(
+        v2_models.PurchaseEntitlement.purchase_token_hash == token_hash
+    ).with_for_update().first()
+    if restore and current_user.role != "family_member":
+        raise HTTPException(status_code=403, detail="only a caregiver can restore a family purchase")
+    if existing is not None and existing.organizer_user_id != current_user.id:
+        # A Play account can be present on more than one backend account.  An
+        # already-bound purchase is not transferable merely because the token
+        # was returned by Google for this device/account.
+        raise HTTPException(status_code=409, detail=PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT)
+    if existing is not None and existing.obfuscated_account_hash and purchase.obfuscated_account_id and _token_hash(purchase.obfuscated_account_id) != existing.obfuscated_account_hash:
+        raise HTTPException(status_code=403, detail="purchase attribution mismatch")
+
+    circle = None
+    if payload.family_circle_id is not None and not restore:
+        circle = circle or _circle_any(db, payload.family_circle_id)
+        _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
+        if existing is not None and existing.family_circle_id != circle.id:
+            raise HTTPException(status_code=409, detail="purchase is already assigned to another family circle")
+        if existing is None and circle.status != "PENDING_PURCHASE":
+            raise HTTPException(status_code=409, detail="family circle is not awaiting purchase")
+    elif existing is None and not restore:
+        raise HTTPException(status_code=404, detail="purchase is not associated with a family circle")
+    elif existing is None and restore:
+        circle = _restore_circle_for_user(db, current_user)
+
+    restore_audit_result = None
     if existing is None:
         try:
             encrypted_token = encrypt_purchase_token(payload.purchase_token)
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail="purchase storage is not configured") from exc
-        circle = _circle_any(db, payload.family_circle_id)
+        circle = circle or _circle_any(db, payload.family_circle_id)
         existing = v2_models.PurchaseEntitlement(
             family_circle_id=circle.id,
             organizer_user_id=current_user.id,
@@ -99,11 +173,13 @@ def _verify_and_apply(payload: VerifyPurchaseRequest, current_user: models.User,
             purchase_state=purchase_state,
             verification_state="PENDING",
             acknowledgement_state="ACKNOWLEDGED" if _state(purchase.acknowledgement_state) == "ACKNOWLEDGED" else "PENDING",
+            source="verified_orphan_recovery" if restore else "google_verify",
             obfuscated_account_hash=_token_hash(purchase.obfuscated_account_id) if purchase.obfuscated_account_id else None,
             purchased_at=purchase.purchased_at,
             last_verified_at=utc_now(),
         )
         db.add(existing)
+        restore_audit_result = "bound" if restore else None
     else:
         if existing.purchase_token_ciphertext is None:
             try:
@@ -115,7 +191,10 @@ def _verify_and_apply(payload: VerifyPurchaseRequest, current_user: models.User,
             existing.acknowledgement_state = "ACKNOWLEDGED"
         existing.last_verified_at = utc_now()
         existing.purchased_at = existing.purchased_at or purchase.purchased_at
-    circle = _circle_any(db, existing.family_circle_id)
+        if restore and not getattr(existing, "source", None):
+            existing.source = "verified_orphan_recovery"
+        restore_audit_result = "idempotent" if restore else None
+    circle = circle or _circle_any(db, existing.family_circle_id)
     if purchase_state == "PURCHASED":
         existing.verification_state = "VERIFIED"
         existing.verified_at = existing.verified_at or utc_now()
@@ -128,7 +207,24 @@ def _verify_and_apply(payload: VerifyPurchaseRequest, current_user: models.User,
     else:
         existing.verification_state = "PENDING"
 
-    db.commit()
+    try:
+        db.flush()
+        if restore and restore_audit_result is not None:
+            _audit_restore(db, current_user, existing, token_hash, restore_audit_result)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        # The unique token constraint is the final arbiter for two caregivers
+        # racing to claim an orphan.  A retry by the same owner is idempotent;
+        # a different owner remains rejected and cannot receive a second row.
+        claimed = db.query(v2_models.PurchaseEntitlement).filter(
+            v2_models.PurchaseEntitlement.purchase_token_hash == token_hash
+        ).first()
+        if claimed is not None and claimed.organizer_user_id == current_user.id:
+            return _entitlement_response(claimed)
+        if claimed is not None:
+            raise HTTPException(status_code=409, detail=PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT) from exc
+        raise HTTPException(status_code=409, detail="purchase restore could not be claimed") from exc
     if purchase_state == "PURCHASED" and existing.acknowledgement_state != "ACKNOWLEDGED":
         try:
             if verifier.acknowledge(PRODUCT_ID, payload.purchase_token):
@@ -149,7 +245,7 @@ def verify_purchase(payload: VerifyPurchaseRequest, current_user: models.User = 
 @router.post("/billing/google/restore", response_model=EntitlementResponse)
 def restore_purchase(payload: VerifyPurchaseRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db), verifier: GooglePlayVerifier = Depends(configured_google_play_verifier)):
     restore_payload = payload.model_copy(update={"family_circle_id": None})
-    return _verify_and_apply(restore_payload, current_user, db, verifier)
+    return _verify_and_apply(restore_payload, current_user, db, verifier, restore=True)
 
 
 @router.get("/family-circles/{circle_id}/entitlement", response_model=EntitlementResponse | None)

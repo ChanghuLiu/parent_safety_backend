@@ -210,6 +210,52 @@ def _ensure_sqlite_migrations():
                     "ON v2_parent_profiles(recovered_from_parent_profile_id)"
                 )
             )
+        purchase_entitlement_columns = connection.execute(
+            sql_text("PRAGMA table_info(v2_purchase_entitlements)")
+        ).fetchall()
+        if purchase_entitlement_columns:
+            purchase_entitlement_column_names = {column[1] for column in purchase_entitlement_columns}
+            if "source" not in purchase_entitlement_column_names:
+                connection.execute(
+                    sql_text(
+                        "ALTER TABLE v2_purchase_entitlements "
+                        "ADD COLUMN source VARCHAR(64) NOT NULL DEFAULT 'google_verify'"
+                    )
+                )
+                logger.info("migration added v2_purchase_entitlements.source column")
+        connection.execute(
+            sql_text(
+                """
+                CREATE TABLE IF NOT EXISTS v2_billing_audit_events (
+                    id INTEGER NOT NULL PRIMARY KEY,
+                    event_type VARCHAR(64) NOT NULL,
+                    source VARCHAR(64) NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    entitlement_id INTEGER,
+                    family_circle_id INTEGER,
+                    product_id VARCHAR(128) NOT NULL,
+                    purchase_token_hash VARCHAR(64) NOT NULL,
+                    result VARCHAR(24) NOT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE RESTRICT,
+                    FOREIGN KEY(entitlement_id) REFERENCES v2_purchase_entitlements (id) ON DELETE RESTRICT,
+                    FOREIGN KEY(family_circle_id) REFERENCES v2_family_circles (id) ON DELETE RESTRICT
+                )
+                """
+            )
+        )
+        connection.execute(
+            sql_text(
+                "CREATE INDEX IF NOT EXISTS ix_v2_billing_audit_user_created "
+                "ON v2_billing_audit_events(user_id, created_at)"
+            )
+        )
+        connection.execute(
+            sql_text(
+                "CREATE INDEX IF NOT EXISTS ix_v2_billing_audit_token_result "
+                "ON v2_billing_audit_events(purchase_token_hash, result)"
+            )
+        )
         connection.execute(
             sql_text(
                 """

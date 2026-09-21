@@ -160,7 +160,7 @@ def test_original_owner_restore_is_idempotent_and_rtdn_is_idempotent(billing_api
     cross_account = client.post("/api/v2/billing/google/restore", headers=other_headers, json=_verify_payload(token, 999999))
     assert cross_account.status_code == 409
     assert cross_account.json()["detail"] == "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"
-    assert verifier.get_purchase_calls == calls_before_cross_account_restore
+    assert verifier.get_purchase_calls == calls_before_cross_account_restore + 1
 
     with database.SessionLocal() as db:
         from v2_models import FamilyCircle, FamilyMembership, PurchaseEntitlement
@@ -200,7 +200,7 @@ def test_cross_account_restore_does_not_mutate_existing_entitlement(billing_api)
     response = client.post("/api/v2/billing/google/restore", headers=other_headers, json=_verify_payload(token, 123456))
     assert response.status_code == 409
     assert response.json() == {"detail": "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"}
-    assert verifier.get_purchase_calls == calls_before
+    assert verifier.get_purchase_calls == calls_before + 1
 
     with database.SessionLocal() as db:
         from v2_models import FamilyCircle, FamilyMembership, PurchaseEntitlement
@@ -213,3 +213,124 @@ def test_cross_account_restore_does_not_mutate_existing_entitlement(billing_api)
         assert entitlement.acknowledgement_state == "ACKNOWLEDGED"
         assert db.query(FamilyMembership).filter(FamilyMembership.family_circle_id == circle_id, FamilyMembership.user_id == original["user_id"], FamilyMembership.role == "ORGANIZER").count() == 1
         assert db.query(FamilyMembership).filter(FamilyMembership.family_circle_id == circle_id, FamilyMembership.user_id != original["user_id"], FamilyMembership.role == "ORGANIZER").count() == 0
+
+
+def test_verified_orphan_restore_creates_circle_and_audits(billing_api):
+    client, database, verifier = billing_api
+    organizer, headers = _register(client, "FAMILY_MEMBER", "Orphan owner", "orphan-device")
+    token = "orphan-restore-token"
+
+    response = client.post("/api/v2/billing/google/restore", headers=headers, json=_verify_payload(token, 999999))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["organizer_user_id"] == organizer["user_id"]
+    with database.SessionLocal() as db:
+        from v2_models import BillingAuditEvent, FamilyCircle, FamilyMembership, PurchaseEntitlement
+        entitlement = db.query(PurchaseEntitlement).one()
+        circle = db.get(FamilyCircle, entitlement.family_circle_id)
+        audit = db.query(BillingAuditEvent).one()
+        assert entitlement.source == "verified_orphan_recovery"
+        assert entitlement.purchase_state == "PURCHASED"
+        assert entitlement.verification_state == "VERIFIED"
+        assert circle.organizer_user_id == organizer["user_id"]
+        assert circle.status == "ACTIVE"
+        assert db.query(FamilyMembership).filter(
+            FamilyMembership.family_circle_id == circle.id,
+            FamilyMembership.user_id == organizer["user_id"],
+            FamilyMembership.role == "ORGANIZER",
+        ).count() == 1
+        assert audit.source == "verified_orphan_recovery"
+        assert audit.result == "bound"
+        assert audit.purchase_token_hash != token
+        assert token not in str(audit.purchase_token_hash)
+
+    retry = client.post("/api/v2/billing/google/restore", headers=headers, json=_verify_payload(token, 123456))
+    assert retry.status_code == 200, retry.text
+    with database.SessionLocal() as db:
+        from v2_models import BillingAuditEvent, PurchaseEntitlement
+        assert db.query(PurchaseEntitlement).count() == 1
+        assert db.query(BillingAuditEvent).count() == 2
+        assert verifier.get_purchase_calls == 2
+
+
+@pytest.mark.parametrize(
+    ("purchase", "expected_detail"),
+    [
+        (FakePurchase(product_id="wrong-product"), "purchase does not match this application"),
+        (FakePurchase(package_name="com.other.app"), "purchase does not match this application"),
+        (FakePurchase(purchase_state="CANCELED"), "purchase is not currently purchased"),
+    ],
+)
+def test_orphan_restore_rejects_unverifiable_or_invalid_play_purchase(billing_api, purchase, expected_detail):
+    client, database, verifier = billing_api
+    _, headers = _register(client, "FAMILY_MEMBER", "Restore owner", f"invalid-{purchase.product_id}-{purchase.package_name}")
+    verifier.purchase = purchase
+
+    response = client.post("/api/v2/billing/google/restore", headers=headers, json=_verify_payload("invalid-orphan-token"))
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == expected_detail
+    with database.SessionLocal() as db:
+        from v2_models import BillingAuditEvent, FamilyCircle, PurchaseEntitlement
+        assert db.query(PurchaseEntitlement).count() == 0
+        assert db.query(FamilyCircle).count() == 0
+        assert db.query(BillingAuditEvent).count() == 0
+
+
+def test_orphan_restore_rejects_google_verification_failure(billing_api):
+    client, database, verifier = billing_api
+    _, headers = _register(client, "FAMILY_MEMBER", "Unavailable verifier", "verifier-failure-device")
+
+    def fail(_purchase_token):
+        raise RuntimeError("developer API unavailable")
+
+    verifier.get_purchase = fail
+    response = client.post("/api/v2/billing/google/restore", headers=headers, json=_verify_payload("unverifiable-token"))
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Google Play verification unavailable"
+    with database.SessionLocal() as db:
+        from v2_models import FamilyCircle, PurchaseEntitlement
+        assert db.query(PurchaseEntitlement).count() == 0
+        assert db.query(FamilyCircle).count() == 0
+
+
+def test_orphan_restore_rejects_parent_role(billing_api):
+    client, database, verifier = billing_api
+    _, headers = _register(client, "PARENT", "Parent claimant", "parent-claim-device")
+
+    response = client.post("/api/v2/billing/google/restore", headers=headers, json=_verify_payload("parent-claim-token"))
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "only a caregiver can restore a family purchase"
+    assert verifier.get_purchase_calls == 1
+    with database.SessionLocal() as db:
+        from v2_models import FamilyCircle, PurchaseEntitlement
+        assert db.query(PurchaseEntitlement).count() == 0
+        assert db.query(FamilyCircle).count() == 0
+
+
+def test_orphan_restore_concurrent_claim_has_one_owner(billing_api):
+    """The unique token constraint decides a first-claim race."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    client, database, verifier = billing_api
+    first_user, first_headers = _register(client, "FAMILY_MEMBER", "First claimant", "race-first")
+    second_user, second_headers = _register(client, "FAMILY_MEMBER", "Second claimant", "race-second")
+    token = "concurrent-orphan-token"
+
+    def restore(headers):
+        return client.post("/api/v2/billing/google/restore", headers=headers, json=_verify_payload(token, 999999))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first, second = list(executor.map(restore, (first_headers, second_headers)))
+
+    assert sorted((first.status_code, second.status_code)) == [200, 409]
+    with database.SessionLocal() as db:
+        from v2_models import FamilyCircle, PurchaseEntitlement
+        assert db.query(PurchaseEntitlement).count() == 1
+        assert db.query(FamilyCircle).filter(FamilyCircle.status == "ACTIVE").count() == 1
+        assert db.query(PurchaseEntitlement).one().organizer_user_id in {
+            first_user["user_id"],
+            second_user["user_id"],
+        }

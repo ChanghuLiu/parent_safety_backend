@@ -41,6 +41,7 @@ class PurchaseEntitlement(Base):
     purchase_state = Column(String(24), nullable=False, default="PENDING", index=True)
     verification_state = Column(String(24), nullable=False, default="PENDING", index=True)
     acknowledgement_state = Column(String(24), nullable=False, default="PENDING")
+    source = Column(String(64), nullable=False, default="google_verify")
     obfuscated_account_hash = Column(String(64), nullable=True)
     purchased_at = Column(DateTime, nullable=True)
     verified_at = Column(DateTime, nullable=True)
@@ -48,6 +49,27 @@ class PurchaseEntitlement(Base):
     revoked_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     updated_at = Column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class BillingAuditEvent(Base):
+    """Safe, non-secret audit trail for server-authorized billing changes."""
+
+    __tablename__ = "v2_billing_audit_events"
+    __table_args__ = (
+        Index("ix_v2_billing_audit_user_created", "user_id", "created_at"),
+        Index("ix_v2_billing_audit_token_result", "purchase_token_hash", "result"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    event_type = Column(String(64), nullable=False)
+    source = Column(String(64), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True)
+    entitlement_id = Column(Integer, ForeignKey("v2_purchase_entitlements.id", ondelete="RESTRICT"), nullable=True, index=True)
+    family_circle_id = Column(Integer, ForeignKey("v2_family_circles.id", ondelete="RESTRICT"), nullable=True, index=True)
+    product_id = Column(String(128), nullable=False)
+    purchase_token_hash = Column(String(64), nullable=False)
+    result = Column(String(24), nullable=False)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 class BillingRtdnEvent(Base):
