@@ -178,6 +178,22 @@ def _ensure_sqlite_migrations():
         if "recovery_device_id" not in column_names:
             connection.execute(sql_text("ALTER TABLE users ADD COLUMN recovery_device_id VARCHAR"))
             logger.info("migration added users.recovery_device_id column")
+        if "organizer_recovery_verifier" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN organizer_recovery_verifier VARCHAR(64)"))
+            logger.info("migration added users.organizer_recovery_verifier column")
+        if "organizer_recovery_created_at" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN organizer_recovery_created_at DATETIME"))
+        if "organizer_recovery_used_at" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN organizer_recovery_used_at DATETIME"))
+        if "organizer_recovery_failed_attempts" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN organizer_recovery_failed_attempts INTEGER NOT NULL DEFAULT 0"))
+        if "organizer_recovery_locked_until" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN organizer_recovery_locked_until DATETIME"))
+        if "organizer_recovery_one_time" not in column_names:
+            connection.execute(sql_text("ALTER TABLE users ADD COLUMN organizer_recovery_one_time BOOLEAN NOT NULL DEFAULT 0"))
+        connection.execute(sql_text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_organizer_recovery_verifier ON users(organizer_recovery_verifier) WHERE organizer_recovery_verifier IS NOT NULL"))
+        connection.execute(sql_text("CREATE TABLE IF NOT EXISTS organizer_recovery_audit_events (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, action VARCHAR(64) NOT NULL, source VARCHAR(64) NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE RESTRICT)"))
+        connection.execute(sql_text("CREATE INDEX IF NOT EXISTS ix_organizer_recovery_audit_user_created ON organizer_recovery_audit_events(user_id, created_at)"))
         connection.execute(
             sql_text(
                 "CREATE INDEX IF NOT EXISTS ix_users_recovery_device_id "

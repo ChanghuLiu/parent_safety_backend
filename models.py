@@ -33,6 +33,14 @@ class User(Base):
     fcm_token = Column(String, nullable=True)
     fcm_token_invalidated_at = Column(DateTime, nullable=True)
     api_token_hash = Column(String(64), nullable=True, unique=True, index=True)
+    # Organizer reinstall recovery is an explicitly user-held secret.  Only
+    # its verifier and non-secret abuse-control metadata are persisted.
+    organizer_recovery_verifier = Column(String(64), nullable=True, unique=True, index=True)
+    organizer_recovery_created_at = Column(DateTime, nullable=True)
+    organizer_recovery_used_at = Column(DateTime, nullable=True)
+    organizer_recovery_failed_attempts = Column(Integer, nullable=False, default=0)
+    organizer_recovery_locked_until = Column(DateTime, nullable=True)
+    organizer_recovery_one_time = Column(Boolean, nullable=False, default=False)
     # Device-local UI/notification language.  This is deliberately attached
     # to the authenticated user/device, never to a family relationship.
     locale_tag = Column(String(32), nullable=True)
@@ -61,6 +69,19 @@ class DevicePushToken(Base):
     push_token = Column(String(4096), nullable=False)
     push_token_updated_at = Column(DateTime, nullable=False)
     push_token_invalidated_at = Column(DateTime, nullable=True)
+
+    user = relationship("User")
+
+
+class OrganizerRecoveryAuditEvent(Base):
+    __tablename__ = "organizer_recovery_audit_events"
+    __table_args__ = (Index("ix_organizer_recovery_audit_user_created", "user_id", "created_at"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    action = Column(String(64), nullable=False)
+    source = Column(String(64), nullable=False)
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
 
     user = relationship("User")
 

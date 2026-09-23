@@ -21,6 +21,8 @@ router = APIRouter(prefix="/api/v2", tags=["parent-check-in-v2"])
 PUBLIC_INVITATION_CODE_ATTEMPT_LIMIT = 5
 PUBLIC_INVITATION_CODE_ATTEMPT_WINDOW_MINUTES = 15
 PUBLIC_INVITATION_CODE_ALLOCATION_ATTEMPTS = 20
+ORGANIZER_RECOVERY_MAX_FAILURES = 5
+ORGANIZER_RECOVERY_LOCK_MINUTES = 15
 
 
 def _hash(value: str) -> str:
@@ -40,6 +42,10 @@ def _normalize_invitation_credential(value: str) -> tuple[str, bool]:
         and all("0" <= character <= "9" for character in without_spaces)
     )
     return (without_spaces, True) if is_public_code else (stripped, False)
+
+
+def _organizer_recovery_code() -> str:
+    return secrets.token_urlsafe(32)
 
 
 def _record_public_code_attempt(db: Session, user_id: int) -> None:
@@ -200,18 +206,54 @@ def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db
             db.refresh(pending)
             return {"user_id": pending.id, "role": payload.role, "api_token": raw_token, "locale_tag": pending.locale_tag}
     raw_token = secrets.token_urlsafe(32)
+    recovery_code = _organizer_recovery_code() if role == "family_member" else None
     user = models.User(
         role=role,
         name=payload.name,
         phone=payload.phone,
         device_id=payload.device_id,
         api_token_hash=_hash(raw_token),
+        organizer_recovery_verifier=_hash(recovery_code) if recovery_code else None,
+        organizer_recovery_created_at=utc_now() if recovery_code else None,
+        organizer_recovery_failed_attempts=0,
         locale_tag=normalize_locale(payload.locale_tag),
     )
     db.add(user)
     db.commit()
     db.refresh(user)
-    return {"user_id": user.id, "role": payload.role, "api_token": raw_token, "locale_tag": user.locale_tag}
+    return {"user_id": user.id, "role": payload.role, "api_token": raw_token, "locale_tag": user.locale_tag, "recovery_code": recovery_code}
+
+
+@router.post("/organizer/recover", response_model=schemas.OrganizerRecoveryResponse)
+def recover_organizer(payload: schemas.OrganizerRecoveryRequest, db: Session = Depends(get_db)):
+    """Recover a pre-existing organizer only with its user-held secret."""
+    user = db.query(models.User).filter(
+        models.User.device_id == payload.device_id,
+        models.User.role == "family_member",
+    ).first()
+    now = utc_now()
+    if user is None or not user.organizer_recovery_verifier:
+        raise HTTPException(status_code=409, detail="organizer recovery is unavailable for this account")
+    if user.organizer_recovery_one_time and user.organizer_recovery_used_at is not None:
+        raise HTTPException(status_code=409, detail="organizer recovery credential has already been used")
+    if user.organizer_recovery_locked_until and user.organizer_recovery_locked_until > now:
+        retry_after = int((user.organizer_recovery_locked_until - now).total_seconds())
+        raise HTTPException(status_code=429, detail="too many recovery attempts; try again later", headers={"Retry-After": str(max(1, retry_after))})
+    if not secrets.compare_digest(user.organizer_recovery_verifier, _hash(payload.recovery_code)):
+        user.organizer_recovery_failed_attempts = (user.organizer_recovery_failed_attempts or 0) + 1
+        if user.organizer_recovery_failed_attempts >= ORGANIZER_RECOVERY_MAX_FAILURES:
+            user.organizer_recovery_locked_until = now + timedelta(minutes=ORGANIZER_RECOVERY_LOCK_MINUTES)
+            user.organizer_recovery_failed_attempts = 0
+        db.commit()
+        raise HTTPException(status_code=401, detail="invalid organizer recovery code")
+    raw_token = secrets.token_urlsafe(32)
+    user.api_token_hash = _hash(raw_token)
+    user.organizer_recovery_failed_attempts = 0
+    user.organizer_recovery_locked_until = None
+    user.organizer_recovery_used_at = now
+    db.add(models.OrganizerRecoveryAuditEvent(user_id=user.id, action="recovered", source="organizer_recovery"))
+    db.commit()
+    return {"user_id": user.id, "role": "FAMILY_MEMBER", "api_token": raw_token, "locale_tag": user.locale_tag or "en"}
 
 
 @router.get("/users/me", response_model=schemas.V2CurrentUserResponse)

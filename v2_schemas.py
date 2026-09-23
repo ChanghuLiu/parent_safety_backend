@@ -23,6 +23,19 @@ class V2RegisterResponse(BaseModel):
     role: Role
     api_token: str
     locale_tag: str
+    recovery_code: str | None = None
+
+
+class OrganizerRecoveryRequest(BaseModel):
+    device_id: str = Field(min_length=8, max_length=255)
+    recovery_code: str = Field(min_length=32, max_length=128)
+
+
+class OrganizerRecoveryResponse(BaseModel):
+    user_id: int
+    role: Role
+    api_token: str
+    locale_tag: str
 
 
 class V2CurrentUserResponse(BaseModel):
