@@ -66,6 +66,7 @@ class InvitationCreateRequest(BaseModel):
 class InvitationResponse(BaseModel):
     invitation_id: int
     token: str
+    public_code: str
     role: InvitationRole
     expires_at: datetime
 

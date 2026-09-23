@@ -18,9 +18,49 @@ from v2_time import CheckInState, as_utc, checkin_result, evaluate_schedule, loc
 
 router = APIRouter(prefix="/api/v2", tags=["parent-check-in-v2"])
 
+PUBLIC_INVITATION_CODE_ATTEMPT_LIMIT = 5
+PUBLIC_INVITATION_CODE_ATTEMPT_WINDOW_MINUTES = 15
+PUBLIC_INVITATION_CODE_ALLOCATION_ATTEMPTS = 20
+
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _public_invitation_code() -> str:
+    """Return an ASCII six-digit code using the OS-backed secrets generator."""
+    return f"{secrets.randbelow(1_000_000):06d}"
+
+
+def _normalize_invitation_credential(value: str) -> tuple[str, bool]:
+    stripped = value.strip()
+    without_spaces = "".join(stripped.split())
+    is_public_code = (
+        len(without_spaces) == 6
+        and all("0" <= character <= "9" for character in without_spaces)
+    )
+    return (without_spaces, True) if is_public_code else (stripped, False)
+
+
+def _record_public_code_attempt(db: Session, user_id: int) -> None:
+    window_start = utc_now() - timedelta(minutes=PUBLIC_INVITATION_CODE_ATTEMPT_WINDOW_MINUTES)
+    db.query(v2_models.V2InvitationAttempt).filter(
+        v2_models.V2InvitationAttempt.attempted_at < window_start,
+    ).delete(synchronize_session=False)
+    recent_attempts = db.query(v2_models.V2InvitationAttempt).filter(
+        v2_models.V2InvitationAttempt.user_id == user_id,
+        v2_models.V2InvitationAttempt.attempted_at >= window_start,
+    ).count()
+    if recent_attempts >= PUBLIC_INVITATION_CODE_ATTEMPT_LIMIT:
+        db.commit()
+        retry_after_seconds = PUBLIC_INVITATION_CODE_ATTEMPT_WINDOW_MINUTES * 60
+        raise HTTPException(
+            status_code=429,
+            detail="too many invitation-code attempts; try again later",
+            headers={"Retry-After": str(retry_after_seconds)},
+        )
+    db.add(v2_models.V2InvitationAttempt(user_id=user_id, attempted_at=utc_now()))
+    db.commit()
 
 
 def _active_membership(db: Session, user_id: int, circle_id: int, roles: tuple[str, ...] | None = None) -> v2_models.FamilyMembership:
@@ -309,25 +349,62 @@ def update_offline_alert_settings_v2(
 def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     circle = _circle(db, circle_id)
     _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
-    token = secrets.token_urlsafe(24)
-    invitation = v2_models.FamilyInvitation(
-        token_hash=_hash(token),
-        family_circle_id=circle.id,
-        invited_role=payload.role,
-        invited_relationship=payload.relationship,
-        invited_by_user_id=current_user.id,
-        expires_at=utc_now() + timedelta(hours=payload.expires_in_hours),
-        status="pending",
-    )
-    db.add(invitation)
+    token = ""
+    public_code = ""
+    invitation = None
+    for _ in range(PUBLIC_INVITATION_CODE_ALLOCATION_ATTEMPTS):
+        candidate_token = secrets.token_urlsafe(24)
+        candidate_code = _public_invitation_code()
+        candidate_invitation = v2_models.FamilyInvitation(
+            token_hash=_hash(candidate_token),
+            public_code_hash=_hash(candidate_code),
+            family_circle_id=circle.id,
+            invited_role=payload.role,
+            invited_relationship=payload.relationship,
+            invited_by_user_id=current_user.id,
+            expires_at=utc_now() + timedelta(hours=payload.expires_in_hours),
+            status="pending",
+        )
+        try:
+            with db.begin_nested():
+                db.add(candidate_invitation)
+                db.flush()
+            token = candidate_token
+            public_code = candidate_code
+            invitation = candidate_invitation
+            break
+        except IntegrityError:
+            # A code collision must never overwrite or retarget an invitation.
+            # Retry with a new independently generated token and code.
+            continue
+    if invitation is None:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="could not allocate invitation code")
     db.commit()
     db.refresh(invitation)
-    return {"invitation_id": invitation.id, "token": token, "role": payload.role, "expires_at": invitation.expires_at}
+    return {
+        "invitation_id": invitation.id,
+        "token": token,
+        "public_code": public_code,
+        "role": payload.role,
+        "expires_at": invitation.expires_at,
+    }
 
 
 @router.post("/invitations/{token}/accept", response_model=schemas.InvitationAcceptResponse)
 def accept_invitation(token: str, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
-    invitation = db.query(v2_models.FamilyInvitation).filter(v2_models.FamilyInvitation.token_hash == _hash(token)).first()
+    credential, is_public_code = _normalize_invitation_credential(token)
+    if is_public_code:
+        _record_public_code_attempt(db, current_user.id)
+        invitation = db.query(v2_models.FamilyInvitation).filter(
+            v2_models.FamilyInvitation.public_code_hash == _hash(credential)
+        ).first()
+    else:
+        # Legacy outstanding invitations continue to resolve through the
+        # original high-entropy token hash.
+        invitation = db.query(v2_models.FamilyInvitation).filter(
+            v2_models.FamilyInvitation.token_hash == _hash(credential)
+        ).first()
     if invitation is not None and invitation.status == "accepted" and invitation.accepted_by_user_id == current_user.id:
         membership = db.query(v2_models.FamilyMembership).filter(
             v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
@@ -341,8 +418,14 @@ def accept_invitation(token: str, current_user: models.User = Depends(get_v2_cur
         ).first()
         if membership is not None and profile is not None and profile.recovered_from_parent_profile_id is not None:
             return {"membership_id": membership.id, "family_circle_id": invitation.family_circle_id, "role": invitation.invited_role, "parent_profile_id": profile.id if profile else None}
-    if invitation is None or invitation.status != "pending" or invitation.expires_at < utc_now():
-        raise HTTPException(status_code=400, detail="invalid or expired invitation")
+    if invitation is None:
+        raise HTTPException(status_code=400, detail="invalid invitation code")
+    if invitation.status != "pending":
+        raise HTTPException(status_code=400, detail="invitation code has already been used")
+    if invitation.expires_at < utc_now():
+        invitation.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail="invitation code has expired")
     if current_user.recovery_device_id is not None and invitation.invited_role != "PARENT":
         raise HTTPException(status_code=403, detail="parent recovery requires a Parent invitation")
     if invitation.invited_role == "PARENT" and current_user.recovery_device_id is not None:

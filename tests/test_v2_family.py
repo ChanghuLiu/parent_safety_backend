@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
@@ -325,24 +326,112 @@ def test_v2_invitation_lifecycle_and_removal(v2_api):
     assert client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=member_headers, json={"role": "FAMILY_MEMBER"}).status_code == 403
 
     expired = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "FAMILY_MEMBER", "expires_in_hours": 1}).json()
+    assert re.fullmatch(r"\d{6}", expired["public_code"])
+    assert expired["public_code"] != expired["token"]
     with database.SessionLocal() as db:
         from datetime import timedelta
         from v2_models import FamilyInvitation
         invitation = db.get(FamilyInvitation, expired["invitation_id"])
         invitation.expires_at = datetime.now() - timedelta(minutes=1)
         db.commit()
-    assert client.post(f"/api/v2/invitations/{expired['token']}/accept", headers=member_headers).status_code == 400
+    expired_response = client.post(f"/api/v2/invitations/{expired['public_code']}/accept", headers=member_headers)
+    assert expired_response.status_code == 400
+    assert expired_response.json()["detail"] == "invitation code has expired"
 
     fresh = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "FAMILY_MEMBER"}).json()
-    accepted = client.post(f"/api/v2/invitations/{fresh['token']}/accept", headers=member_headers)
+    spaced_code = f"{fresh['public_code'][:3]} {fresh['public_code'][3:]}"
+    accepted = client.post(f"/api/v2/invitations/{spaced_code}/accept", headers=member_headers)
     assert accepted.status_code == 200
-    assert client.post(f"/api/v2/invitations/{fresh['token']}/accept", headers=member_headers).status_code == 400
+    reused = client.post(f"/api/v2/invitations/{fresh['public_code']}/accept", headers=member_headers)
+    assert reused.status_code == 400
+    assert reused.json()["detail"] == "invitation code has already been used"
     membership_id = accepted.json()["membership_id"]
     assert client.delete(f"/api/v2/family-circles/{circle_id}/members/{membership_id}", headers=organizer_headers).status_code == 200
     listed = client.get(f"/api/v2/family-circles/{circle_id}/members", headers=organizer_headers)
     assert listed.status_code == 200 and all(member["membership_id"] != membership_id for member in listed.json())
     assert client.get(f"/api/v2/family-circles/{circle_id}", headers=member_headers).status_code == 403
     assert client.get(f"/api/v2/family-circles/{circle_id}").status_code == 401
+
+
+def test_v2_public_invitation_code_resolves_only_its_invitation_and_legacy_token_still_works(v2_api):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "public-code-organizer")
+    _, first_headers = _register(client, "FAMILY_MEMBER", "First", "public-code-first")
+    _, second_headers = _register(client, "FAMILY_MEMBER", "Second", "public-code-second")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Circle"}).json()
+    _activate_test_circle(database, circle["id"])
+
+    first_invitation = client.post(
+        f"/api/v2/family-circles/{circle['id']}/invitations",
+        headers=organizer_headers,
+        json={"role": "FAMILY_MEMBER"},
+    ).json()
+    legacy_invitation = client.post(
+        f"/api/v2/family-circles/{circle['id']}/invitations",
+        headers=organizer_headers,
+        json={"role": "FAMILY_MEMBER"},
+    ).json()
+
+    wrong = client.post("/api/v2/invitations/999 998/accept", headers=first_headers)
+    assert wrong.status_code == 400
+    assert wrong.json()["detail"] == "invalid invitation code"
+
+    accepted = client.post(
+        f"/api/v2/invitations/{first_invitation['public_code']}/accept",
+        headers=first_headers,
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["family_circle_id"] == circle["id"]
+
+    legacy_accepted = client.post(
+        f"/api/v2/invitations/{legacy_invitation['token']}/accept",
+        headers=second_headers,
+    )
+    assert legacy_accepted.status_code == 200
+    assert legacy_accepted.json()["family_circle_id"] == circle["id"]
+
+
+def test_v2_public_invitation_code_collision_retries_without_overwriting(v2_api, monkeypatch):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "collision-organizer")
+    _, first_headers = _register(client, "FAMILY_MEMBER", "First", "collision-first")
+    _, second_headers = _register(client, "FAMILY_MEMBER", "Second", "collision-second")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Circle"}).json()
+    _activate_test_circle(database, circle["id"])
+
+    generated = iter((123456, 123456, 654321))
+    monkeypatch.setattr("v2_routes.secrets.randbelow", lambda _: next(generated))
+
+    first = client.post(
+        f"/api/v2/family-circles/{circle['id']}/invitations",
+        headers=organizer_headers,
+        json={"role": "FAMILY_MEMBER"},
+    ).json()
+    second = client.post(
+        f"/api/v2/family-circles/{circle['id']}/invitations",
+        headers=organizer_headers,
+        json={"role": "FAMILY_MEMBER"},
+    ).json()
+
+    assert first["public_code"] == "123456"
+    assert second["public_code"] == "654321"
+    first_accept = client.post("/api/v2/invitations/123456/accept", headers=first_headers)
+    second_accept = client.post("/api/v2/invitations/654321/accept", headers=second_headers)
+    assert first_accept.status_code == second_accept.status_code == 200
+    assert first_accept.json()["family_circle_id"] == circle["id"]
+    assert second_accept.json()["family_circle_id"] == circle["id"]
+
+
+def test_v2_public_invitation_code_attempts_are_rate_limited(v2_api):
+    client, _ = v2_api
+    _, member_headers = _register(client, "FAMILY_MEMBER", "Member", "rate-limit-member")
+
+    for code in ("900001", "900002", "900003", "900004", "900005"):
+        assert client.post(f"/api/v2/invitations/{code}/accept", headers=member_headers).status_code == 400
+
+    limited = client.post("/api/v2/invitations/900006/accept", headers=member_headers)
+    assert limited.status_code == 429
+    assert limited.headers["Retry-After"] == "900"
 
 
 def test_v2_scheduler_is_restart_safe(v2_api):

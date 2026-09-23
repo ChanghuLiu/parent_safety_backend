@@ -199,11 +199,15 @@ class FamilyInvitation(Base):
     __tablename__ = "v2_family_invitations"
     __table_args__ = (
         UniqueConstraint("token_hash", name="uq_v2_invitation_token"),
+        UniqueConstraint("public_code_hash", name="uq_v2_invitation_public_code"),
         Index("ix_v2_invitation_circle_status", "family_circle_id", "status"),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     token_hash = Column(String(64), nullable=False)
+    # The six-digit code is a separate, human-readable lookup credential.  It
+    # never replaces the high-entropy legacy token and is hashed at rest.
+    public_code_hash = Column(String(64), nullable=True)
     family_circle_id = Column(Integer, ForeignKey("v2_family_circles.id", ondelete="CASCADE"), nullable=False)
     invited_role = Column(String(24), nullable=False)
     invited_relationship = Column(String(64), nullable=True)
@@ -215,6 +219,17 @@ class FamilyInvitation(Base):
     accepted_at = Column(DateTime, nullable=True)
 
     circle = sa_relationship("FamilyCircle")
+
+
+class V2InvitationAttempt(Base):
+    __tablename__ = "v2_invitation_attempts"
+    __table_args__ = (
+        Index("ix_v2_invitation_attempt_user_time", "user_id", "attempted_at"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    attempted_at = Column(DateTime, nullable=False, index=True)
 
 
 class EscalationRule(Base):

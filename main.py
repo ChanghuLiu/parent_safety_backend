@@ -209,6 +209,26 @@ def _ensure_sqlite_migrations():
                     "ix_v2_parent_profiles_recovered_from_parent_profile_id "
                     "ON v2_parent_profiles(recovered_from_parent_profile_id)"
                 )
+                )
+        invitation_columns = connection.execute(
+            sql_text("PRAGMA table_info(v2_family_invitations)")
+        ).fetchall()
+        if invitation_columns:
+            invitation_column_names = {column[1] for column in invitation_columns}
+            if "public_code_hash" not in invitation_column_names:
+                connection.execute(
+                    sql_text(
+                        "ALTER TABLE v2_family_invitations "
+                        "ADD COLUMN public_code_hash VARCHAR(64)"
+                    )
+                )
+                logger.info("migration added v2_family_invitations.public_code_hash column")
+            connection.execute(
+                sql_text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_v2_invitation_public_code "
+                    "ON v2_family_invitations(public_code_hash) "
+                    "WHERE public_code_hash IS NOT NULL"
+                )
             )
         purchase_entitlement_columns = connection.execute(
             sql_text("PRAGMA table_info(v2_purchase_entitlements)")
