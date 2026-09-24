@@ -99,6 +99,22 @@ def _circle_any(db: Session, circle_id: int) -> v2_models.FamilyCircle:
     return circle
 
 
+def _presentation(db: Session, circle_id: int, viewer_id: int, subject_id: int):
+    return db.query(v2_models.RelationshipPresentation).filter(
+        v2_models.RelationshipPresentation.family_circle_id == circle_id,
+        v2_models.RelationshipPresentation.viewer_user_id == viewer_id,
+        v2_models.RelationshipPresentation.subject_user_id == subject_id,
+    ).first()
+
+
+def _presented_name(presentation, fallback: str) -> str:
+    return (presentation.display_name.strip() if presentation and presentation.display_name else fallback) or fallback
+
+
+def _presented_avatar(presentation, fallback: str | None) -> str | None:
+    return presentation.avatar_url if presentation and presentation.avatar_url else fallback
+
+
 def _offline_setting_response(setting: v2_models.OfflineAlertSetting | None) -> dict:
     return {
         "offline_alert_enabled": setting.offline_alert_enabled if setting else True,
@@ -359,11 +375,11 @@ def list_members(circle_id: int, current_user: models.User = Depends(get_v2_curr
         {
             "membership_id": member.id,
             "user_id": member.user_id,
-            "display_name": member.user.name if member.user else "",
+            "display_name": _presented_name(_presentation(db, circle_id, current_user.id, member.user_id), member.user.name if member.user else ""),
             "role": member.role,
             "relationship": member.relationship,
         "phone": member.user.phone if member.user else None,
-            "avatar_url": member.user.avatar_url if member.user else None,
+            "avatar_url": _presented_avatar(_presentation(db, circle_id, current_user.id, member.user_id), member.user.avatar_url if member.user else None),
             "membership_status": member.membership_status,
         }
         for member in members
@@ -862,12 +878,20 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
     if active_help is not None:
         state = CheckInState.HELP_REQUESTED.value
     device = db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == profile.user_id).first()
+    organizer_membership = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.family_circle_id == profile.family_circle_id,
+        v2_models.FamilyMembership.role == "ORGANIZER",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).first()
+    organizer = organizer_membership.user if organizer_membership else None
+    parent_view = _presentation(db, profile.family_circle_id, profile.user_id, organizer.id) if organizer else None
+    organizer_view = _presentation(db, profile.family_circle_id, organizer.id, profile.user_id) if organizer else None
     return {
         "parent_profile_id": profile.id,
         "parent_user_id": profile.user_id,
-        "display_name": profile.display_name,
+        "display_name": _presented_name(organizer_view, profile.display_name),
         "phone": profile.user.phone if profile.user else None,
-        "avatar_url": profile.user.avatar_url if profile.user else None,
+        "avatar_url": _presented_avatar(organizer_view, profile.user.avatar_url if profile.user else None),
         "timezone": profile.timezone,
         "state": state,
         "last_checkin_utc": latest.occurred_at if latest else None,
@@ -876,9 +900,9 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
         "battery_level": device.battery_level if device else (latest.battery_level if latest else None),
         "last_online_utc": device.last_online_time if device else None,
         "current_local": localize_utc(now, profile.timezone).isoformat(),
-        "organizer_name": next((m.user.name for m in db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == profile.family_circle_id, v2_models.FamilyMembership.role == "ORGANIZER", v2_models.FamilyMembership.membership_status == "active").all() if m.user), None),
-        "organizer_phone": next((m.user.phone for m in db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == profile.family_circle_id, v2_models.FamilyMembership.role == "ORGANIZER", v2_models.FamilyMembership.membership_status == "active").all() if m.user), None),
-        "organizer_avatar_url": next((m.user.avatar_url for m in db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == profile.family_circle_id, v2_models.FamilyMembership.role == "ORGANIZER", v2_models.FamilyMembership.membership_status == "active").all() if m.user), None),
+        "organizer_name": _presented_name(parent_view, organizer.name if organizer else "Family manager"),
+        "organizer_phone": organizer.phone if organizer else None,
+        "organizer_avatar_url": _presented_avatar(parent_view, organizer.avatar_url if organizer else None),
     }
 
 
@@ -1005,14 +1029,43 @@ def update_parent_profile(circle_id: int, parent_id: int, payload: schemas.UserP
         raise HTTPException(status_code=404, detail="parent user not found")
     if payload.phone is not None:
         parent.phone = payload.phone.strip()
+    presentation = _presentation(db, circle_id, current_user.id, parent.id)
+    if presentation is None:
+        presentation = v2_models.RelationshipPresentation(family_circle_id=circle_id, viewer_user_id=current_user.id, subject_user_id=parent.id)
+        db.add(presentation)
     if payload.name is not None:
-        parent.name = payload.name.strip()
-        profile.display_name = parent.name
+        presentation.display_name = payload.name.strip() or None
     if payload.avatar_url is not None:
-        parent.avatar_url = payload.avatar_url.strip() or None
+        presentation.avatar_url = payload.avatar_url.strip() or None
     db.commit()
     db.refresh(parent)
     return current_user_v2(current_user=parent, db=db)
+
+
+@router.put("/family-circles/{circle_id}/organizer/presentation", response_model=schemas.ActionResponse)
+def update_organizer_presentation(circle_id: int, payload: schemas.UserProfileUpdateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    """Allow the connected Parent to choose how the family manager appears locally."""
+    _circle(db, circle_id)
+    _active_membership(db, current_user.id, circle_id, ("PARENT",))
+    organizer = _active_membership(db, current_user.id, circle_id, ("PARENT",))
+    del organizer
+    organizer_membership = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.family_circle_id == circle_id,
+        v2_models.FamilyMembership.role == "ORGANIZER",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).first()
+    if organizer_membership is None:
+        raise HTTPException(status_code=404, detail="family manager not found")
+    presentation = _presentation(db, circle_id, current_user.id, organizer_membership.user_id)
+    if presentation is None:
+        presentation = v2_models.RelationshipPresentation(family_circle_id=circle_id, viewer_user_id=current_user.id, subject_user_id=organizer_membership.user_id)
+        db.add(presentation)
+    if payload.name is not None:
+        presentation.display_name = payload.name.strip() or None
+    if payload.avatar_url is not None:
+        presentation.avatar_url = payload.avatar_url.strip() or None
+    db.commit()
+    return {"success": True, "status": "updated"}
 
 
 @router.post("/parents/me/help-requests", response_model=schemas.HelpRequestResponse)

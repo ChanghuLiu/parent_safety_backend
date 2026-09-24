@@ -241,7 +241,8 @@ def test_organizer_can_update_connected_parent_phone_but_parent_cannot_update_an
     assert accepted.status_code == 200
     parent_profile_id = accepted.json()["parent_profile_id"]
     updated = client.put(f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/profile", headers=organizer_headers, json={"phone": " +1 416 555 0111 ", "name": "Mom", "avatar_url": "content://avatar/mom"})
-    assert updated.status_code == 200 and updated.json()["phone"] == "+1 416 555 0111" and updated.json()["name"] == "Mom" and updated.json()["avatar_url"] == "content://avatar/mom"
+    assert updated.status_code == 200 and updated.json()["phone"] == "+1 416 555 0111"
+    assert updated.json()["name"] == "Parent" and updated.json()["avatar_url"] is None
     status = client.get(f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/status", headers=organizer_headers)
     assert status.status_code == 200 and status.json()["display_name"] == "Mom" and status.json()["avatar_url"] == "content://avatar/mom" and status.json()["current_local"]
     forbidden = client.put(f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/profile", headers=parent_headers, json={"phone": "+1 416 555 0222"})

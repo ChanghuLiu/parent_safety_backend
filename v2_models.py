@@ -104,6 +104,27 @@ class FamilyMembership(Base):
     user = sa_relationship("User")
 
 
+class RelationshipPresentation(Base):
+    """Viewer-specific presentation for a linked family member.
+
+    Names and avatars here are intentionally not account identity fields: each
+    member may choose how the other member appears on their own device.
+    """
+    __tablename__ = "v2_relationship_presentations"
+    __table_args__ = (UniqueConstraint("family_circle_id", "viewer_user_id", "subject_user_id", name="uq_v2_relationship_presentation"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    family_circle_id = Column(Integer, ForeignKey("v2_family_circles.id", ondelete="CASCADE"), nullable=False, index=True)
+    viewer_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    subject_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    display_name = Column(String(100), nullable=True)
+    avatar_url = Column(String(2048), nullable=True)
+
+    circle = sa_relationship("FamilyCircle")
+    viewer = sa_relationship("User", foreign_keys=[viewer_user_id])
+    subject = sa_relationship("User", foreign_keys=[subject_user_id])
+
+
 class ParentProfile(Base):
     __tablename__ = "v2_parent_profiles"
     __table_args__ = (
