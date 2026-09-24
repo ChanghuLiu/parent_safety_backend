@@ -229,6 +229,23 @@ def test_parent_phone_profile_round_trip_and_checkin_supersedes_older_help(v2_ap
     assert status.status_code == 200 and status.json()["state"] == "CHECKED_IN"
 
 
+def test_organizer_can_update_connected_parent_phone_but_parent_cannot_update_another_parent(v2_api):
+    client, database = v2_api
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "phone-owner-organizer")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "phone-owner-parent")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Phone ownership"})
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    accepted = client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers)
+    assert accepted.status_code == 200
+    parent_profile_id = accepted.json()["parent_profile_id"]
+    updated = client.put(f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/profile", headers=organizer_headers, json={"phone": " +1 416 555 0111 "})
+    assert updated.status_code == 200 and updated.json()["phone"] == "+1 416 555 0111"
+    forbidden = client.put(f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/profile", headers=parent_headers, json={"phone": "+1 416 555 0222"})
+    assert forbidden.status_code == 403
+
+
 @pytest.mark.parametrize(
     ("request_type", "expected_wire_value"),
     [

@@ -975,6 +975,26 @@ def check_parent_now(circle_id: int, parent_id: int, current_user: models.User =
     return {"success": True, "status": f"queued:{queued}"}
 
 
+@router.put("/family-circles/{circle_id}/parents/{parent_id}/profile", response_model=schemas.V2CurrentUserResponse)
+def update_parent_profile(circle_id: int, parent_id: int, payload: schemas.UserProfileUpdateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    _circle(db, circle_id)
+    _active_membership(db, current_user.id, circle_id, ("ORGANIZER",))
+    profile = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.id == parent_id,
+        v2_models.ParentProfile.family_circle_id == circle_id,
+        v2_models.ParentProfile.active.is_(True),
+    ).first()
+    if profile is None:
+        raise HTTPException(status_code=404, detail="parent not found")
+    parent = db.get(models.User, profile.user_id)
+    if parent is None:
+        raise HTTPException(status_code=404, detail="parent user not found")
+    parent.phone = payload.phone.strip()
+    db.commit()
+    db.refresh(parent)
+    return current_user_v2(current_user=parent, db=db)
+
+
 @router.post("/parents/me/help-requests", response_model=schemas.HelpRequestResponse)
 def create_help_request(payload: schemas.HelpRequestCreate, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     profile = _parent_for_user(db, current_user.id)

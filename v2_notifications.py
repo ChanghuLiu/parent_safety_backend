@@ -155,7 +155,23 @@ def dispatch_queued_notifications(db: Session) -> int:
             continue
         delivery.attempts += 1
         event_type = delivery.event_key.split(":", 1)[0]
-        if _send_push_notification(db, user, delivery.title, delivery.body, event_type=event_type):
+        if event_type == "check-now":
+            try:
+                profile_id = int(delivery.event_key.split(":", 2)[1])
+            except (IndexError, ValueError):
+                profile_id = 0
+            profile = db.get(v2_models.ParentProfile, profile_id)
+            delivered_ok = False
+            if profile is not None:
+                from main import _send_push_data_notification
+                delivered_ok = _send_push_data_notification(
+                    db,
+                    user,
+                    {"event_type": "check_now", "parent_user_id": str(profile.user_id)},
+                )
+        else:
+            delivered_ok = _send_push_notification(db, user, delivery.title, delivery.body, event_type=event_type)
+        if delivered_ok:
             delivery.status = "delivered"
             delivery.delivered_at = datetime.utcnow()
             delivered += 1
