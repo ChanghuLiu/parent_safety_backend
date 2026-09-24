@@ -107,9 +107,11 @@ def _presentation(db: Session, circle_id: int, viewer_id: int, subject_id: int):
     ).first()
 
 
-def _presented_name(presentation, fallback: str) -> str:
+def _presented_name(presentation, fallback: str, role_fallback: str | None = None) -> str:
     value = (presentation.display_name.strip() if presentation and presentation.display_name else fallback).strip()
-    if not value or value.casefold() in {"family member", "member"}:
+    if not value or value.casefold() in {"family member", "member", "parent", "family manager"}:
+        if role_fallback:
+            return role_fallback
         return "Parent" if fallback.casefold() in {"family member", "member", "parent"} else "Family manager"
     return value
 
@@ -378,7 +380,11 @@ def list_members(circle_id: int, current_user: models.User = Depends(get_v2_curr
         {
             "membership_id": member.id,
             "user_id": member.user_id,
-            "display_name": _presented_name(_presentation(db, circle_id, current_user.id, member.user_id), member.user.name if member.user else ""),
+            "display_name": _presented_name(
+                _presentation(db, circle_id, current_user.id, member.user_id),
+                member.user.name if member.user else "",
+                "Parent" if member.role == "PARENT" else "Family manager" if member.role == "ORGANIZER" else "Family member",
+            ),
             "role": member.role,
             "relationship": member.relationship,
         "phone": member.user.phone if member.user else None,
@@ -892,7 +898,7 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
     return {
         "parent_profile_id": profile.id,
         "parent_user_id": profile.user_id,
-        "display_name": _presented_name(organizer_view, profile.display_name),
+        "display_name": _presented_name(organizer_view, profile.display_name, "Parent"),
         "phone": profile.user.phone if profile.user else None,
         "avatar_url": _presented_avatar(organizer_view, profile.user.avatar_url if profile.user else None),
         "timezone": profile.timezone,
@@ -903,7 +909,7 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
         "battery_level": device.battery_level if device else (latest.battery_level if latest else None),
         "last_online_utc": device.last_online_time if device else None,
         "current_local": localize_utc(now, profile.timezone).isoformat(),
-        "organizer_name": _presented_name(parent_view, organizer.name if organizer else "Family manager"),
+        "organizer_name": _presented_name(parent_view, organizer.name if organizer else "Family manager", "Family manager"),
         "organizer_phone": organizer.phone if organizer else None,
         "organizer_avatar_url": _presented_avatar(parent_view, organizer.avatar_url if organizer else None),
     }

@@ -8,8 +8,19 @@ import sys
 import httpx
 import pytest
 import hashlib
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def test_relationship_presentation_role_fallbacks_are_directional():
+    import v2_routes
+
+    generic_parent = SimpleNamespace(display_name="Parent")
+    generic_manager = SimpleNamespace(display_name="Family Member")
+    assert v2_routes._presented_name(generic_parent, "Parent", "Parent") == "Parent"
+    assert v2_routes._presented_name(generic_manager, "Parent", "Parent") == "Parent"
+    assert v2_routes._presented_name(generic_parent, "Parent", "Family manager") == "Family manager"
 
 
 @pytest.fixture()
