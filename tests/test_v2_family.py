@@ -203,6 +203,32 @@ def test_android_not_well_help_alias_is_accepted_and_stored_canonically(v2_api):
         assert stored.request_type == "not_feeling_well"
 
 
+def test_parent_phone_profile_round_trip_and_checkin_supersedes_older_help(v2_api):
+    client, database = v2_api
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "phone-organizer-device")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "phone-parent-device")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Phone family"})
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(f"/api/v2/family-circles/{circle_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    assert client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers).status_code == 200
+
+    before = client.get("/api/v2/users/me", headers=parent_headers)
+    assert before.status_code == 200 and before.json()["phone"] is None
+    saved = client.put("/api/v2/users/me/profile", headers=parent_headers, json={"phone": "  +1 416 555 0100  "})
+    assert saved.status_code == 200 and saved.json()["phone"] == "+1 416 555 0100"
+    parents = client.get(f"/api/v2/family-circles/{circle_id}/parents", headers=organizer_headers)
+    assert parents.status_code == 200 and parents.json()[0]["phone"] == "+1 416 555 0100"
+
+    help_response = client.post("/api/v2/parents/me/help-requests", headers=parent_headers, json={"request_type": "home_help"})
+    assert help_response.status_code == 200
+    checkin = client.post("/api/v2/parents/me/check-ins", headers=parent_headers, json={"idempotency_key": "phone-checkin-after-help"})
+    assert checkin.status_code == 200 and checkin.json()["duplicate"] is False
+    parent_id = parents.json()[0]["parent_profile_id"]
+    status = client.get(f"/api/v2/family-circles/{circle_id}/parents/{parent_id}/status", headers=organizer_headers)
+    assert status.status_code == 200 and status.json()["state"] == "CHECKED_IN"
+
+
 @pytest.mark.parametrize(
     ("request_type", "expected_wire_value"),
     [

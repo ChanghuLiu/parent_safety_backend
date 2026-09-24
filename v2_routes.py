@@ -279,7 +279,16 @@ def current_user_v2(current_user: models.User = Depends(get_v2_current_user), db
         "locale_tag": normalize_locale(current_user.locale_tag),
         "has_parent_membership": any(membership.role == "PARENT" for membership in active_memberships),
         "has_organizer_membership": any(membership.role == "ORGANIZER" for membership in active_memberships),
+        "phone": current_user.phone or None,
     }
+
+
+@router.put("/users/me/profile", response_model=schemas.V2CurrentUserResponse)
+def update_current_user_profile(payload: schemas.UserProfileUpdateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    current_user.phone = payload.phone.strip()
+    db.commit()
+    db.refresh(current_user)
+    return current_user_v2(current_user=current_user, db=db)
 
 
 @router.post("/family-circles", response_model=schemas.CircleResponse)
@@ -834,10 +843,13 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
         local_today = localize_utc(now, profile.timezone).date()
         state = CheckInState.CHECKED_IN.value if latest and localize_utc(latest.occurred_at, profile.timezone).date() == local_today else CheckInState.UPCOMING.value
         next_local = None
-    active_help = db.query(v2_models.V2HelpRequest).filter(
+    help_query = db.query(v2_models.V2HelpRequest).filter(
         v2_models.V2HelpRequest.parent_profile_id == profile.id,
         v2_models.V2HelpRequest.status.in_(["created", "acknowledged"]),
-    ).first()
+    )
+    if latest is not None:
+        help_query = help_query.filter(v2_models.V2HelpRequest.created_at > latest.occurred_at)
+    active_help = help_query.order_by(v2_models.V2HelpRequest.created_at.desc()).first()
     if active_help is not None:
         state = CheckInState.HELP_REQUESTED.value
     device = db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == profile.user_id).first()

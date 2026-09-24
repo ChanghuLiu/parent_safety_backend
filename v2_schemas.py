@@ -45,6 +45,11 @@ class V2CurrentUserResponse(BaseModel):
     locale_tag: str
     has_parent_membership: bool = False
     has_organizer_membership: bool = False
+    phone: str | None = None
+
+
+class UserProfileUpdateRequest(BaseModel):
+    phone: str = Field(default="", max_length=32)
 
 
 class CircleCreateRequest(BaseModel):
