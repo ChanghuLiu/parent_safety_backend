@@ -7,6 +7,7 @@ import sys
 
 import httpx
 import pytest
+import hashlib
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -146,6 +147,39 @@ def test_v2_circle_parent_checkin_and_authorization(v2_api):
     other_circle = client.post("/api/v2/family-circles", headers=other_headers, json={"name": "Other"})
     other_id = other_circle.json()["id"]
     assert client.get(f"/api/v2/family-circles/{other_id}/parents/{parent_id}/status", headers=other_headers).status_code in {403, 404}
+
+
+def test_duplicate_registration_logs_non_secret_conflict_fingerprint(v2_api, caplog):
+    client, database = v2_api
+    device_id = "duplicate-registration-device"
+    registered, _ = _register(client, "FAMILY_MEMBER", "Organizer", device_id)
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="parent_safety"):
+        response = client.post(
+            "/api/v2/register",
+            json={
+                "role": "FAMILY_MEMBER",
+                "name": "Organizer",
+                "phone": "",
+                "device_id": device_id,
+                "locale_tag": "en",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "device is already registered for this role"
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    expected_fp = hashlib.sha256(device_id.encode("utf-8")).hexdigest()
+    assert "event=register_duplicate_conflict" in messages
+    assert f"existing_user_id={registered['user_id']}" in messages
+    assert "role=family_member" in messages
+    assert f"device_fp={expected_fp}" in messages
+    assert device_id not in messages
+    assert registered["api_token"] not in messages
+    assert registered["recovery_code"] not in messages
+    with database.SessionLocal() as db:
+        assert db.query(__import__("models").User).count() == 1
 
 
 def test_android_not_well_help_alias_is_accepted_and_stored_canonically(v2_api):

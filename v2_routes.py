@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -17,6 +18,7 @@ from v2_time import CheckInState, as_utc, checkin_result, evaluate_schedule, loc
 
 
 router = APIRouter(prefix="/api/v2", tags=["parent-check-in-v2"])
+logger = logging.getLogger("parent_safety")
 
 PUBLIC_INVITATION_CODE_ATTEMPT_LIMIT = 5
 PUBLIC_INVITATION_CODE_ATTEMPT_WINDOW_MINUTES = 15
@@ -186,6 +188,14 @@ def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db
         db.refresh(pending)
         return {"user_id": pending.id, "role": payload.role, "api_token": raw_token, "locale_tag": pending.locale_tag}
     if existing is not None:
+        logger.warning(
+            "register_duplicate_conflict event=register_duplicate_conflict "
+            "existing_user_id=%s role=%s device_fp=%s timestamp=%s",
+            existing.id,
+            role,
+            _hash(payload.device_id),
+            utc_now().isoformat(),
+        )
         raise HTTPException(status_code=409, detail="device is already registered for this role")
     pending = db.query(models.User).filter(
         models.User.role == role,
