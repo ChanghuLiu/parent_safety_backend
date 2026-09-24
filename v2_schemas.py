@@ -46,10 +46,13 @@ class V2CurrentUserResponse(BaseModel):
     has_parent_membership: bool = False
     has_organizer_membership: bool = False
     phone: str | None = None
+    avatar_url: str | None = None
 
 
 class UserProfileUpdateRequest(BaseModel):
-    phone: str = Field(default="", max_length=32)
+    phone: str | None = Field(default=None, max_length=32)
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    avatar_url: str | None = Field(default=None, max_length=2048)
 
 
 class CircleCreateRequest(BaseModel):
@@ -72,6 +75,7 @@ class MemberResponse(BaseModel):
     role: str
     relationship: str | None
     phone: str | None = None
+    avatar_url: str | None = None
     membership_status: str
 
 
@@ -140,6 +144,11 @@ class ParentStatusResponse(BaseModel):
     next_checkin_local: str | None
     battery_level: int | None
     last_online_utc: datetime | None
+    current_local: str | None = None
+    organizer_name: str | None = None
+    organizer_phone: str | None = None
+    organizer_avatar_url: str | None = None
+    avatar_url: str | None = None
 
 
 class HistoryItemResponse(BaseModel):

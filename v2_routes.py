@@ -280,12 +280,20 @@ def current_user_v2(current_user: models.User = Depends(get_v2_current_user), db
         "has_parent_membership": any(membership.role == "PARENT" for membership in active_memberships),
         "has_organizer_membership": any(membership.role == "ORGANIZER" for membership in active_memberships),
         "phone": current_user.phone or None,
+        "avatar_url": current_user.avatar_url,
     }
 
 
 @router.put("/users/me/profile", response_model=schemas.V2CurrentUserResponse)
 def update_current_user_profile(payload: schemas.UserProfileUpdateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
-    current_user.phone = payload.phone.strip()
+    if payload.phone is not None:
+        current_user.phone = payload.phone.strip()
+    if payload.name is not None:
+        current_user.name = payload.name.strip()
+        for profile in db.query(v2_models.ParentProfile).filter(v2_models.ParentProfile.user_id == current_user.id, v2_models.ParentProfile.active.is_(True)).all():
+            profile.display_name = current_user.name
+    if payload.avatar_url is not None:
+        current_user.avatar_url = payload.avatar_url.strip() or None
     db.commit()
     db.refresh(current_user)
     return current_user_v2(current_user=current_user, db=db)
@@ -354,7 +362,8 @@ def list_members(circle_id: int, current_user: models.User = Depends(get_v2_curr
             "display_name": member.user.name if member.user else "",
             "role": member.role,
             "relationship": member.relationship,
-            "phone": member.user.phone if member.user else None,
+        "phone": member.user.phone if member.user else None,
+            "avatar_url": member.user.avatar_url if member.user else None,
             "membership_status": member.membership_status,
         }
         for member in members
@@ -858,6 +867,7 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
         "parent_user_id": profile.user_id,
         "display_name": profile.display_name,
         "phone": profile.user.phone if profile.user else None,
+        "avatar_url": profile.user.avatar_url if profile.user else None,
         "timezone": profile.timezone,
         "state": state,
         "last_checkin_utc": latest.occurred_at if latest else None,
@@ -865,6 +875,10 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
         "next_checkin_local": next_local,
         "battery_level": device.battery_level if device else (latest.battery_level if latest else None),
         "last_online_utc": device.last_online_time if device else None,
+        "current_local": localize_utc(now, profile.timezone).isoformat(),
+        "organizer_name": next((m.user.name for m in db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == profile.family_circle_id, v2_models.FamilyMembership.role == "ORGANIZER", v2_models.FamilyMembership.membership_status == "active").all() if m.user), None),
+        "organizer_phone": next((m.user.phone for m in db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == profile.family_circle_id, v2_models.FamilyMembership.role == "ORGANIZER", v2_models.FamilyMembership.membership_status == "active").all() if m.user), None),
+        "organizer_avatar_url": next((m.user.avatar_url for m in db.query(v2_models.FamilyMembership).filter(v2_models.FamilyMembership.family_circle_id == profile.family_circle_id, v2_models.FamilyMembership.role == "ORGANIZER", v2_models.FamilyMembership.membership_status == "active").all() if m.user), None),
     }
 
 
@@ -989,7 +1003,13 @@ def update_parent_profile(circle_id: int, parent_id: int, payload: schemas.UserP
     parent = db.get(models.User, profile.user_id)
     if parent is None:
         raise HTTPException(status_code=404, detail="parent user not found")
-    parent.phone = payload.phone.strip()
+    if payload.phone is not None:
+        parent.phone = payload.phone.strip()
+    if payload.name is not None:
+        parent.name = payload.name.strip()
+        profile.display_name = parent.name
+    if payload.avatar_url is not None:
+        parent.avatar_url = payload.avatar_url.strip() or None
     db.commit()
     db.refresh(parent)
     return current_user_v2(current_user=parent, db=db)

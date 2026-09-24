@@ -25,6 +25,9 @@ class User(Base):
     role = Column(String, nullable=False, index=True)
     name = Column(String, nullable=False)
     phone = Column(String, nullable=False)
+    # Optional profile avatar reference.  The value is a non-secret URI or
+    # object reference; absence remains the normal state.
+    avatar_url = Column(String(2048), nullable=True)
     device_id = Column(String, nullable=False, index=True)
     # A reinstall-created Parent identity is intentionally unpaired until the
     # original circle organizer authorizes recovery through an invitation.
