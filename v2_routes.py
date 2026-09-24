@@ -108,7 +108,10 @@ def _presentation(db: Session, circle_id: int, viewer_id: int, subject_id: int):
 
 
 def _presented_name(presentation, fallback: str) -> str:
-    return (presentation.display_name.strip() if presentation and presentation.display_name else fallback) or fallback
+    value = (presentation.display_name.strip() if presentation and presentation.display_name else fallback).strip()
+    if not value or value.casefold() in {"family member", "member"}:
+        return "Parent" if fallback.casefold() in {"family member", "member", "parent"} else "Family manager"
+    return value
 
 
 def _presented_avatar(presentation, fallback: str | None) -> str | None:
