@@ -2,6 +2,8 @@
 
 import hashlib
 import os
+import secrets
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.exc import IntegrityError
@@ -14,7 +16,13 @@ from database import get_db
 from google_play_verifier import GooglePlayVerifier, configured_google_play_verifier
 from purchase_token_crypto import encrypt_purchase_token
 from v2_auth import get_v2_current_user
-from v2_billing_schemas import EntitlementResponse, RtdnRequest, VerifyPurchaseRequest
+from v2_billing_schemas import (
+    EntitlementResponse,
+    OrganizerPurchaseRecoveryRequest,
+    OrganizerPurchaseRecoveryResponse,
+    RtdnRequest,
+    VerifyPurchaseRequest,
+)
 from v2_routes import _active_membership, _circle_any
 from v2_time import utc_now
 
@@ -27,10 +35,34 @@ else:
 router = APIRouter(prefix="/api/v2", tags=["parent-check-in-billing"])
 
 PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT = "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"
+PURCHASE_RECOVERY_MAX_ATTEMPTS = 5
+PURCHASE_RECOVERY_WINDOW_MINUTES = 15
 
 
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _purchase_recovery_attempt_or_429(db: Session, device_hash: str, token_hash: str) -> models.OrganizerPurchaseRecoveryAttempt:
+    window_start = utc_now() - timedelta(minutes=PURCHASE_RECOVERY_WINDOW_MINUTES)
+    recent = db.query(models.OrganizerPurchaseRecoveryAttempt).filter(
+        models.OrganizerPurchaseRecoveryAttempt.device_fingerprint == device_hash,
+        models.OrganizerPurchaseRecoveryAttempt.attempted_at >= window_start,
+    ).count()
+    if recent >= PURCHASE_RECOVERY_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail="too many purchase recovery attempts; try again later",
+            headers={"Retry-After": str(PURCHASE_RECOVERY_WINDOW_MINUTES * 60)},
+        )
+    attempt = models.OrganizerPurchaseRecoveryAttempt(
+        device_fingerprint=device_hash,
+        purchase_token_hash=token_hash,
+        attempted_at=utc_now(),
+    )
+    db.add(attempt)
+    db.flush()
+    return attempt
 
 
 def _state(value: str | None) -> str:
@@ -246,6 +278,88 @@ def verify_purchase(payload: VerifyPurchaseRequest, current_user: models.User = 
 def restore_purchase(payload: VerifyPurchaseRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db), verifier: GooglePlayVerifier = Depends(configured_google_play_verifier)):
     restore_payload = payload.model_copy(update={"family_circle_id": None})
     return _verify_and_apply(restore_payload, current_user, db, verifier, restore=True)
+
+
+@router.post("/organizer/recover-with-purchase", response_model=OrganizerPurchaseRecoveryResponse)
+def recover_organizer_with_purchase(
+    payload: OrganizerPurchaseRecoveryRequest,
+    db: Session = Depends(get_db),
+    verifier: GooglePlayVerifier = Depends(configured_google_play_verifier),
+):
+    """Recover the organizer already bound to a verified, still-owned Lifetime purchase.
+
+    The purchase token is an ownership proof, never an organizer selector.  A
+    successful request always resolves the existing entitlement's organizer
+    and circle, and repeated recovery remains allowed while Google reports the
+    same purchase as valid.
+    """
+    token_hash = _token_hash(payload.purchase_token)
+    device_hash = _token_hash(payload.device_id)
+    try:
+        attempt = _purchase_recovery_attempt_or_429(db, device_hash, token_hash)
+        db.commit()
+        purchase = verifier.get_purchase(payload.purchase_token)
+        if purchase.package_name != PACKAGE_NAME or purchase.product_id != PRODUCT_ID:
+            raise HTTPException(status_code=400, detail="purchase does not match this application")
+        if _state(purchase.purchase_state) != "PURCHASED":
+            raise HTTPException(status_code=400, detail="purchase is not currently purchased")
+        entitlement = db.query(v2_models.PurchaseEntitlement).filter(
+            v2_models.PurchaseEntitlement.purchase_token_hash == token_hash,
+        ).with_for_update().first()
+        if entitlement is None:
+            raise HTTPException(status_code=404, detail="purchase is not associated with an organizer")
+        if (
+            entitlement.package_name != PACKAGE_NAME
+            or entitlement.product_id != PRODUCT_ID
+            or entitlement.verification_state != "VERIFIED"
+            or entitlement.purchase_state != "PURCHASED"
+            or entitlement.revoked_at is not None
+        ):
+            raise HTTPException(status_code=400, detail="purchase entitlement is not currently valid")
+        circle = _circle_any(db, entitlement.family_circle_id)
+        organizer = db.get(models.User, entitlement.organizer_user_id)
+        if organizer is None or organizer.role != "family_member" or circle.organizer_user_id != organizer.id:
+            raise HTTPException(status_code=409, detail="purchase organizer binding is invalid")
+        membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id == circle.id,
+            v2_models.FamilyMembership.user_id == organizer.id,
+            v2_models.FamilyMembership.role == "ORGANIZER",
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
+        if membership is None:
+            raise HTTPException(status_code=409, detail="purchase organizer membership is unavailable")
+        raw_token = secrets.token_urlsafe(32)
+        recovery_code = secrets.token_urlsafe(32)
+        organizer.device_id = payload.device_id
+        organizer.recovery_device_id = payload.device_id
+        organizer.api_token_hash = _token_hash(raw_token)
+        organizer.organizer_recovery_verifier = _token_hash(recovery_code)
+        organizer.organizer_recovery_created_at = utc_now()
+        organizer.organizer_recovery_used_at = None
+        organizer.organizer_recovery_failed_attempts = 0
+        organizer.organizer_recovery_locked_until = None
+        organizer.organizer_recovery_one_time = False
+        attempt.user_id = organizer.id
+        attempt.success = True
+        db.add(models.OrganizerRecoveryAuditEvent(
+            user_id=organizer.id,
+            action="purchase_recovered",
+            source="google_purchase_recovery",
+        ))
+        db.commit()
+        return {
+            "user_id": organizer.id,
+            "role": "FAMILY_MEMBER",
+            "api_token": raw_token,
+            "locale_tag": organizer.locale_tag or "en",
+            "recovery_code": recovery_code,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail="purchase recovery verification unavailable") from exc
 
 
 @router.get("/family-circles/{circle_id}/entitlement", response_model=EntitlementResponse | None)

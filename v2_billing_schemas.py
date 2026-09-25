@@ -21,6 +21,19 @@ class EntitlementResponse(BaseModel):
     updated_at: datetime | None
 
 
+class OrganizerPurchaseRecoveryRequest(BaseModel):
+    device_id: str = Field(min_length=8, max_length=255)
+    purchase_token: str = Field(min_length=1, max_length=8192)
+
+
+class OrganizerPurchaseRecoveryResponse(BaseModel):
+    user_id: int
+    role: Literal["PARENT", "FAMILY_MEMBER"]
+    api_token: str
+    locale_tag: str
+    recovery_code: str
+
+
 class RtdnRequest(BaseModel):
     message_id: str = Field(min_length=1, max_length=255)
     notification_type: Literal["ONE_TIME_PRODUCT_PURCHASED", "ONE_TIME_PRODUCT_CANCELED"]

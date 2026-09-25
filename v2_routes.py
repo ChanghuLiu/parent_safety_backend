@@ -287,6 +287,35 @@ def recover_organizer(payload: schemas.OrganizerRecoveryRequest, db: Session = D
     return {"user_id": user.id, "role": "FAMILY_MEMBER", "api_token": raw_token, "locale_tag": user.locale_tag or "en"}
 
 
+@router.post("/organizer/recovery-code/rotate", response_model=schemas.OrganizerRecoveryRotationResponse)
+def rotate_organizer_recovery_code(current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    """Rotate an organizer's user-held recovery secret while authenticated."""
+    if current_user.role != "family_member":
+        raise HTTPException(status_code=403, detail="only an organizer can rotate recovery credentials")
+    membership = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.user_id == current_user.id,
+        v2_models.FamilyMembership.role == "ORGANIZER",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).first()
+    if membership is None:
+        raise HTTPException(status_code=403, detail="only an active organizer can rotate recovery credentials")
+    recovery_code = _organizer_recovery_code()
+    current_user.organizer_recovery_verifier = _hash(recovery_code)
+    current_user.organizer_recovery_created_at = utc_now()
+    current_user.organizer_recovery_used_at = None
+    current_user.organizer_recovery_failed_attempts = 0
+    current_user.organizer_recovery_locked_until = None
+    current_user.organizer_recovery_one_time = False
+    db.add(models.OrganizerRecoveryAuditEvent(user_id=current_user.id, action="rotated", source="authenticated_rotation"))
+    db.commit()
+    return {
+        "user_id": current_user.id,
+        "role": "FAMILY_MEMBER",
+        "locale_tag": current_user.locale_tag or "en",
+        "recovery_code": recovery_code,
+    }
+
+
 @router.get("/users/me", response_model=schemas.V2CurrentUserResponse)
 def current_user_v2(current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     active_memberships = db.query(v2_models.FamilyMembership).filter(

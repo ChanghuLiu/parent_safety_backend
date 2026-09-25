@@ -38,6 +38,26 @@ class OrganizerRecoveryResponse(BaseModel):
     locale_tag: str
 
 
+class OrganizerRecoveryRotationResponse(BaseModel):
+    user_id: int
+    role: Role
+    locale_tag: str
+    recovery_code: str
+
+
+class OrganizerPurchaseRecoveryRequest(BaseModel):
+    device_id: str = Field(min_length=8, max_length=255)
+    purchase_token: str = Field(min_length=1, max_length=8192)
+
+
+class OrganizerPurchaseRecoveryResponse(BaseModel):
+    user_id: int
+    role: Role
+    api_token: str
+    locale_tag: str
+    recovery_code: str
+
+
 class V2CurrentUserResponse(BaseModel):
     user_id: int
     role: Role

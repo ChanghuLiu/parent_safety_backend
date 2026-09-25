@@ -89,6 +89,28 @@ class OrganizerRecoveryAuditEvent(Base):
     user = relationship("User")
 
 
+class OrganizerPurchaseRecoveryAttempt(Base):
+    """Rate-limit/audit metadata for unauthenticated Play recovery attempts.
+
+    Only non-secret hashes are retained; the purchase token and device ID are
+    never stored in plaintext or written to logs.
+    """
+    __tablename__ = "organizer_purchase_recovery_attempts"
+    __table_args__ = (
+        Index("ix_purchase_recovery_attempt_device_time", "device_fingerprint", "attempted_at"),
+        Index("ix_purchase_recovery_attempt_token_time", "purchase_token_hash", "attempted_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_fingerprint = Column(String(64), nullable=False)
+    purchase_token_hash = Column(String(64), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    success = Column(Boolean, nullable=False, default=False)
+    attempted_at = Column(DateTime, nullable=False, server_default=func.now(), index=True)
+
+    user = relationship("User")
+
+
 class DeletedApiToken(Base):
     __tablename__ = "deleted_api_tokens"
 
