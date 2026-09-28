@@ -111,6 +111,7 @@ class InvitationResponse(BaseModel):
     public_code: str
     role: InvitationRole
     expires_at: datetime
+    purpose: str = "PARENT_CONNECT"
 
 
 class InvitationAcceptResponse(BaseModel):

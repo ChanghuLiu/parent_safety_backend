@@ -232,6 +232,9 @@ class FamilyInvitation(Base):
     family_circle_id = Column(Integer, ForeignKey("v2_family_circles.id", ondelete="CASCADE"), nullable=False)
     invited_role = Column(String(24), nullable=False)
     invited_relationship = Column(String(64), nullable=True)
+    # Persist server-authorized intent so redemption never infers recovery
+    # from a device-lineage marker.
+    purpose = Column(String(32), nullable=False, default="PARENT_CONNECT", index=True)
     invited_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
     accepted_by_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     expires_at = Column(DateTime, nullable=False)

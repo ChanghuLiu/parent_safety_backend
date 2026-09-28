@@ -239,6 +239,20 @@ def _ensure_sqlite_migrations():
                     )
                 )
                 logger.info("migration added v2_family_invitations.public_code_hash column")
+            if "purpose" not in invitation_column_names:
+                connection.execute(
+                    sql_text(
+                        "ALTER TABLE v2_family_invitations "
+                        "ADD COLUMN purpose VARCHAR(32) NOT NULL DEFAULT 'PARENT_CONNECT'"
+                    )
+                )
+                logger.info("migration added v2_family_invitations.purpose column")
+            connection.execute(
+                sql_text(
+                    "CREATE INDEX IF NOT EXISTS ix_v2_invitation_purpose "
+                    "ON v2_family_invitations(purpose)"
+                )
+            )
             connection.execute(
                 sql_text(
                     "CREATE UNIQUE INDEX IF NOT EXISTS uq_v2_invitation_public_code "

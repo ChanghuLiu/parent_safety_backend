@@ -326,10 +326,10 @@ def test_parent_capability_can_own_one_circle_without_losing_parent_membership(v
     assert invite.status_code == 200
     assert client.post(f"/api/v2/invitations/{invite.json()['token']}/accept", headers=parent_headers).status_code == 200
     _, second_parent_headers = _register(client, "PARENT", "Second parent", "second-parent-device")
-    second_invite = client.post(f"/api/v2/family-circles/{existing_id}/invitations", headers=organizer_headers, json={"role": "PARENT"})
+    second_invite = client.post(f"/api/v2/family-circles/{existing_id}/invitations", headers=organizer_headers, json={"role": "FAMILY_MEMBER"})
     assert second_invite.status_code == 200
     second_accept = client.post(f"/api/v2/invitations/{second_invite.json()['token']}/accept", headers=second_parent_headers)
-    assert second_accept.status_code == 409
+    assert second_accept.status_code == 200
 
     created = client.post("/api/v2/family-circles", headers=parent_headers, json={"name": "Parent-owned"})
     assert created.status_code == 200, created.text

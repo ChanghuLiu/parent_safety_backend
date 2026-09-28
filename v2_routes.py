@@ -171,6 +171,18 @@ def _circle_response(db: Session, circle: v2_models.FamilyCircle, viewer_user_id
 @router.post("/register", response_model=schemas.V2RegisterResponse)
 def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db)):
     role = "parent" if payload.role == "PARENT" else "family_member"
+    existing_v2_parent = None
+    if role == "parent":
+        # V2 membership is authoritative for Parent identity. Legacy accounts
+        # may still have users.role=family_member while owning PARENT.
+        existing_v2_parent = db.query(models.User).join(
+            v2_models.FamilyMembership,
+            v2_models.FamilyMembership.user_id == models.User.id,
+        ).filter(
+            models.User.device_id == payload.device_id,
+            v2_models.FamilyMembership.role == "PARENT",
+            v2_models.FamilyMembership.membership_status == "active",
+        ).first()
     existing = db.query(models.User).filter(models.User.device_id == payload.device_id, models.User.role == role).first()
     if existing is not None and role == "parent":
         # A reinstall must not receive the old account's token.  Create or
@@ -222,6 +234,18 @@ def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db
         models.User.role == role,
         models.User.recovery_device_id == payload.device_id,
     ).order_by(models.User.id.desc()).first()
+    if pending is None and existing_v2_parent is not None and role == "parent":
+        pending = models.User(
+            role=role,
+            name=payload.name,
+            phone=payload.phone,
+            device_id=f"pending-parent-{uuid4().hex}",
+            recovery_device_id=payload.device_id,
+            api_token_hash=None,
+            locale_tag=normalize_locale(payload.locale_tag),
+        )
+        db.add(pending)
+        db.flush()
     if pending is not None:
         active_membership = db.query(v2_models.FamilyMembership).filter(
             v2_models.FamilyMembership.user_id == pending.id,
@@ -473,6 +497,11 @@ def update_offline_alert_settings_v2(
 def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     circle = _circle(db, circle_id)
     _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
+    active_parent_count = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.family_circle_id == circle.id,
+        v2_models.ParentProfile.active.is_(True),
+    ).count()
+    purpose = "PARENT_RECONNECT" if payload.role == "PARENT" and active_parent_count == 1 else "PARENT_CONNECT"
     token = ""
     public_code = ""
     invitation = None
@@ -485,6 +514,7 @@ def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, 
             family_circle_id=circle.id,
             invited_role=payload.role,
             invited_relationship=payload.relationship,
+            purpose=purpose,
             invited_by_user_id=current_user.id,
             expires_at=utc_now() + timedelta(hours=payload.expires_in_hours),
             status="pending",
@@ -512,6 +542,79 @@ def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, 
         "public_code": public_code,
         "role": payload.role,
         "expires_at": invitation.expires_at,
+        "purpose": invitation.purpose,
+    }
+
+
+def _accept_parent_reconnect(invitation, current_user: models.User, db: Session):
+    if current_user.role != "parent":
+        raise HTTPException(status_code=403, detail="parent reconnect requires a Parent identity")
+    organizer_membership = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
+        v2_models.FamilyMembership.user_id == invitation.invited_by_user_id,
+        v2_models.FamilyMembership.role == "ORGANIZER",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).first()
+    if organizer_membership is None:
+        raise HTTPException(status_code=403, detail="invitation organizer is not active")
+    if db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.user_id == current_user.id,
+        v2_models.FamilyMembership.membership_status == "active",
+    ).first() is not None:
+        raise HTTPException(status_code=409, detail="parent reconnect requires an unpaired identity")
+    active_profiles = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.family_circle_id == invitation.family_circle_id,
+        v2_models.ParentProfile.active.is_(True),
+    ).all()
+    if len(active_profiles) != 1:
+        raise HTTPException(status_code=409, detail="parent reconnect requires exactly one active parent")
+    old_profile = active_profiles[0]
+    old_membership = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
+        v2_models.FamilyMembership.user_id == old_profile.user_id,
+        v2_models.FamilyMembership.role == "PARENT",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).first()
+    if old_membership is None:
+        raise HTTPException(status_code=409, detail="parent reconnect requires an active original parent")
+    current_profile = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.user_id == current_user.id,
+        v2_models.ParentProfile.active.is_(True),
+    ).first()
+    if current_profile is not None:
+        raise HTTPException(status_code=409, detail="parent reconnect identity already owns a parent profile")
+    old_user = db.get(models.User, old_profile.user_id)
+    now = utc_now()
+    old_membership.membership_status = "replaced"
+    membership = v2_models.FamilyMembership(
+        family_circle_id=invitation.family_circle_id,
+        user_id=current_user.id,
+        role="PARENT",
+        relationship=invitation.invited_relationship,
+        membership_status="active",
+    )
+    db.add(membership)
+    db.flush()
+    old_user.api_token_hash = None
+    old_user.fcm_token = None
+    old_user.fcm_token_invalidated_at = now
+    old_user.device_id = f"replaced-parent-{old_user.id}-{uuid4().hex}"
+    for old_token in db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == old_user.id).all():
+        old_token.push_token_invalidated_at = now
+    db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == old_user.id).delete(synchronize_session=False)
+    # Keep the original profile row and therefore all check-in/help history.
+    old_profile.user_id = current_user.id
+    current_user.recovery_device_id = None
+    invitation.status = "accepted"
+    invitation.accepted_by_user_id = current_user.id
+    invitation.accepted_at = now
+    db.commit()
+    db.refresh(old_profile)
+    return {
+        "membership_id": membership.id,
+        "family_circle_id": invitation.family_circle_id,
+        "role": invitation.invited_role,
+        "parent_profile_id": old_profile.id,
     }
 
 
@@ -540,7 +643,10 @@ def accept_invitation(token: str, current_user: models.User = Depends(get_v2_cur
             v2_models.ParentProfile.user_id == current_user.id,
             v2_models.ParentProfile.active.is_(True),
         ).first()
-        if membership is not None and profile is not None and profile.recovered_from_parent_profile_id is not None:
+        if membership is not None and profile is not None and (
+            profile.recovered_from_parent_profile_id is not None
+            or getattr(invitation, "purpose", "PARENT_CONNECT") == "PARENT_RECONNECT"
+        ):
             return {"membership_id": membership.id, "family_circle_id": invitation.family_circle_id, "role": invitation.invited_role, "parent_profile_id": profile.id if profile else None}
     if invitation is None:
         raise HTTPException(status_code=400, detail="invalid invitation code")
@@ -550,6 +656,8 @@ def accept_invitation(token: str, current_user: models.User = Depends(get_v2_cur
         invitation.status = "expired"
         db.commit()
         raise HTTPException(status_code=400, detail="invitation code has expired")
+    if getattr(invitation, "purpose", "PARENT_CONNECT") == "PARENT_RECONNECT":
+        return _accept_parent_reconnect(invitation, current_user, db)
     if current_user.recovery_device_id is not None and invitation.invited_role != "PARENT":
         raise HTTPException(status_code=403, detail="parent recovery requires a Parent invitation")
     if invitation.invited_role == "PARENT" and current_user.recovery_device_id is not None:

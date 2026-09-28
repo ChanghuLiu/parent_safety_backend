@@ -75,7 +75,8 @@ def test_parent_reinstall_is_pending_until_original_organizer_authorizes(v2_api)
         assert db.query(ParentProfile).filter(ParentProfile.family_circle_id == circle_id, ParentProfile.active.is_(True)).count() == 1
         assert db.query(User).filter(User.id == old_parent["user_id"], User.api_token_hash.is_(None)).count() == 1
         recovered_profile = db.query(ParentProfile).filter(ParentProfile.user_id == replacement["user_id"], ParentProfile.active.is_(True)).one()
-        assert recovered_profile.recovered_from_parent_profile_id is not None
+        assert recovered_profile.id == recovered.json()["parent_profile_id"] == 1
+        assert recovered_profile.recovered_from_parent_profile_id is None
         old_token = db.query(DevicePushToken).filter(DevicePushToken.user_id == old_parent["user_id"]).one()
         assert old_token.push_token_invalidated_at is not None
         assert db.query(DevicePushToken).filter(DevicePushToken.user_id == replacement["user_id"], DevicePushToken.push_provider == "fcm").count() == 1
@@ -97,10 +98,10 @@ def test_device_id_alone_does_not_recover_parent_account(v2_api):
     assert client.post(f"/api/v2/invitations/{invite['token']}/accept", headers=old_parent_headers).status_code == 200
     recovery_invite = client.post(f"/api/v2/family-circles/{circle['id']}/invitations", headers=organizer_headers, json={"role": "PARENT"}).json()
     intruder, intruder_headers = _register(client, "PARENT", "Intruder", "intruder-device")
-    # A normal Parent identity cannot use a device ID to claim the protected
-    # membership, and receives no old account token or active membership.
+    # An explicit organizer-issued reconnect invitation authorizes an
+    # otherwise-unpaired Parent; device lineage is not the authorization.
     assert intruder["user_id"] != old_parent["user_id"]
-    assert client.post(f"/api/v2/invitations/{recovery_invite['token']}/accept", headers=intruder_headers).status_code == 409
+    assert client.post(f"/api/v2/invitations/{recovery_invite['token']}/accept", headers=intruder_headers).status_code == 200
     with database.SessionLocal() as db:
         from v2_models import FamilyMembership
         assert db.query(FamilyMembership).filter(FamilyMembership.family_circle_id == circle["id"], FamilyMembership.role == "PARENT", FamilyMembership.membership_status == "active").count() == 1
