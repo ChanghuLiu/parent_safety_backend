@@ -69,6 +69,11 @@ class V2CurrentUserResponse(BaseModel):
     avatar_url: str | None = None
 
 
+class RelationshipAvatarResponse(BaseModel):
+    avatar_url: str
+    sha256: str
+
+
 class UserProfileUpdateRequest(BaseModel):
     phone: str | None = Field(default=None, max_length=32)
     name: str | None = Field(default=None, min_length=1, max_length=100)
@@ -86,6 +91,7 @@ class CircleResponse(BaseModel):
     member_count: int
     organizer_name: str
     membership_role: str | None = None
+    parent_reconnect_available: bool = False
 
 
 class MemberResponse(BaseModel):

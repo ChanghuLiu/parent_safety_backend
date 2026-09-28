@@ -579,3 +579,284 @@ def test_v2_mock_multidevice_localized_workflow(v2_api):
         assert {row.locale_tag for row in rows} == {"en", "ar"}
         assert any(row.provider == "fcm" and "checked in" in row.body for row in rows)
         assert any(row.provider == "android_huawei" and "أكد" in row.body for row in rows)
+
+
+def test_organizer_disconnect_parent_preserves_profile_and_reconnects_same_identity(v2_api):
+    client, database = v2_api
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "disconnect-organizer-device")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "disconnect-parent-device")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Disconnect family"})
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+
+    invite = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    ).json()
+    accepted = client.post(
+        f"/api/v2/invitations/{invite['token']}/accept",
+        headers=parent_headers,
+    )
+    assert accepted.status_code == 200
+    parent_profile_id = accepted.json()["parent_profile_id"]
+
+    assert client.post(
+        "/api/v2/parents/me/check-ins",
+        headers=parent_headers,
+        json={"idempotency_key": "disconnect-history"},
+    ).status_code == 200
+    assert client.post(
+        "/api/v2/parents/me/help-requests",
+        headers=parent_headers,
+        json={"request_type": "home_help"},
+    ).status_code == 200
+
+    disconnected = client.post(
+        f"/api/v2/family-circles/{circle_id}/parent/disconnect",
+        headers=organizer_headers,
+    )
+    assert disconnected.status_code == 200
+    assert disconnected.json()["status"] == "parent_disconnected"
+    disconnected_circle = client.get(f"/api/v2/family-circles/{circle_id}", headers=organizer_headers)
+    assert disconnected_circle.status_code == 200
+    assert disconnected_circle.json()["parent_reconnect_available"] is True
+
+    from v2_models import FamilyMembership, ParentDisconnectAuditEvent, ParentProfile
+    with database.SessionLocal() as db:
+        membership = db.query(FamilyMembership).filter(
+            FamilyMembership.family_circle_id == circle_id,
+            FamilyMembership.user_id == parent["user_id"],
+        ).one()
+        profile = db.get(ParentProfile, parent_profile_id)
+        assert membership.membership_status == "disconnected"
+        assert profile.active is False
+        assert db.query(ParentDisconnectAuditEvent).count() == 1
+
+    reconnect = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    )
+    assert reconnect.status_code == 200
+    assert reconnect.json()["purpose"] == "PARENT_RECONNECT"
+
+    restored = client.post(
+        f"/api/v2/invitations/{reconnect.json()['token']}/accept",
+        headers=parent_headers,
+    )
+    assert restored.status_code == 200
+    assert restored.json()["parent_profile_id"] == parent_profile_id
+    restored_circle = client.get(f"/api/v2/family-circles/{circle_id}", headers=organizer_headers)
+    assert restored_circle.status_code == 200
+    assert restored_circle.json()["parent_reconnect_available"] is False
+
+    with database.SessionLocal() as db:
+        membership = db.query(FamilyMembership).filter(
+            FamilyMembership.family_circle_id == circle_id,
+            FamilyMembership.user_id == parent["user_id"],
+        ).one()
+        profile = db.get(ParentProfile, parent_profile_id)
+        assert membership.membership_status == "active"
+        assert profile.active is True
+
+    history = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/history",
+        headers=organizer_headers,
+    )
+    assert history.status_code == 200
+    assert len(history.json()) >= 2
+
+
+def test_relationship_avatar_is_server_durable_and_follows_parent_replacement(v2_api):
+    client, database = v2_api
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "avatar-organizer-device")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "avatar-parent-device")
+    replacement, replacement_headers = _register(client, "PARENT", "Replacement", "avatar-replacement-device")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Avatar family"})
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+
+    invite = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    ).json()
+    accepted = client.post(
+        f"/api/v2/invitations/{invite['token']}/accept",
+        headers=parent_headers,
+    ).json()
+    parent_profile_id = accepted["parent_profile_id"]
+
+    client.put(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/profile",
+        headers=organizer_headers,
+        json={"name": "Mom"},
+    )
+    jpeg_bytes = b"\xff\xd8\xff\xe0parent-checkin-avatar"
+    uploaded = client.put(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+        files={"file": ("avatar.jpg", jpeg_bytes, "image/jpeg")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json()["avatar_url"].startswith("relationship-avatar:")
+
+    status = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/status",
+        headers=organizer_headers,
+    )
+    assert status.status_code == 200
+    assert status.json()["display_name"] == "Mom"
+    assert status.json()["avatar_url"].startswith("relationship-avatar:")
+
+    downloaded = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == jpeg_bytes
+    assert downloaded.headers["content-type"].startswith("image/jpeg")
+
+    forbidden = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=parent_headers,
+    )
+    assert forbidden.status_code == 403
+
+    disconnected = client.post(
+        f"/api/v2/family-circles/{circle_id}/parent/disconnect",
+        headers=organizer_headers,
+    )
+    assert disconnected.status_code == 200
+    reconnect = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    ).json()
+    restored = client.post(
+        f"/api/v2/invitations/{reconnect['token']}/accept",
+        headers=replacement_headers,
+    )
+    assert restored.status_code == 200
+    assert restored.json()["parent_profile_id"] == parent_profile_id
+
+    status_after = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/status",
+        headers=organizer_headers,
+    )
+    assert status_after.status_code == 200
+    assert status_after.json()["display_name"] == "Mom"
+    assert status_after.json()["avatar_url"].startswith("relationship-avatar:")
+    downloaded_after = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+    )
+    assert downloaded_after.status_code == 200
+    assert downloaded_after.content == jpeg_bytes
+
+    removed = client.delete(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+    )
+    assert removed.status_code == 200
+    status_removed = client.get(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/status",
+        headers=organizer_headers,
+    )
+    assert status_removed.status_code == 200
+    assert status_removed.json()["avatar_url"] is None
+
+
+def test_non_organizer_cannot_disconnect_parent(v2_api):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "disconnect-auth-organizer")
+    _, parent_headers = _register(client, "PARENT", "Parent", "disconnect-auth-parent")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Authorization family"})
+    circle_id = circle.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    ).json()
+    assert client.post(
+        f"/api/v2/invitations/{invite['token']}/accept",
+        headers=parent_headers,
+    ).status_code == 200
+    forbidden = client.post(
+        f"/api/v2/family-circles/{circle_id}/parent/disconnect",
+        headers=parent_headers,
+    )
+    assert forbidden.status_code == 403
+
+
+def test_relationship_avatar_rejects_bad_type_and_oversize(v2_api):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "avatar-validation-organizer")
+    _, parent_headers = _register(client, "PARENT", "Parent", "avatar-validation-parent")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Avatar validation"}).json()
+    circle_id = circle["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    ).json()
+    accepted = client.post(
+        f"/api/v2/invitations/{invite['token']}/accept",
+        headers=parent_headers,
+    ).json()
+    parent_profile_id = accepted["parent_profile_id"]
+
+    wrong_type = client.put(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+        files={"file": ("avatar.txt", b"not an image", "text/plain")},
+    )
+    assert wrong_type.status_code == 415
+
+    fake_jpeg = client.put(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+        files={"file": ("avatar.jpg", b"not-jpeg", "image/jpeg")},
+    )
+    assert fake_jpeg.status_code == 400
+
+    oversized = b"\xff\xd8\xff" + (b"x" * (512 * 1024))
+    too_large = client.put(
+        f"/api/v2/family-circles/{circle_id}/parents/{parent_profile_id}/presentation-avatar",
+        headers=organizer_headers,
+        files={"file": ("avatar.jpg", oversized, "image/jpeg")},
+    )
+    assert too_large.status_code == 413
+
+
+def test_parent_disconnect_is_idempotent(v2_api):
+    client, database = v2_api
+    _, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "disconnect-idempotent-organizer")
+    _, parent_headers = _register(client, "PARENT", "Parent", "disconnect-idempotent-parent")
+    circle = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Disconnect idempotent"}).json()
+    circle_id = circle["id"]
+    _activate_test_circle(database, circle_id)
+    invite = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT"},
+    ).json()
+    assert client.post(
+        f"/api/v2/invitations/{invite['token']}/accept",
+        headers=parent_headers,
+    ).status_code == 200
+
+    first = client.post(
+        f"/api/v2/family-circles/{circle_id}/parent/disconnect",
+        headers=organizer_headers,
+    )
+    second = client.post(
+        f"/api/v2/family-circles/{circle_id}/parent/disconnect",
+        headers=organizer_headers,
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["status"] == "parent_disconnected"

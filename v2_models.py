@@ -5,7 +5,7 @@ explicitly named table set.  This lets the test database be recreated without
 silently rewriting the historical API's data model.
 """
 
-from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, Column, Date, DateTime, ForeignKey, Index, Integer, LargeBinary, String, UniqueConstraint
 from sqlalchemy.orm import relationship as sa_relationship
 from sqlalchemy.sql import func
 
@@ -119,6 +119,9 @@ class RelationshipPresentation(Base):
     subject_user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     display_name = Column(String(100), nullable=True)
     avatar_url = Column(String(2048), nullable=True)
+    avatar_blob = Column(LargeBinary, nullable=True)
+    avatar_mime_type = Column(String(64), nullable=True)
+    avatar_sha256 = Column(String(64), nullable=True)
 
     circle = sa_relationship("FamilyCircle")
     viewer = sa_relationship("User", foreign_keys=[viewer_user_id])
@@ -241,6 +244,7 @@ class FamilyInvitation(Base):
     status = Column(String(24), nullable=False, default="pending", index=True)
     created_at = Column(DateTime, nullable=False, server_default=func.now())
     accepted_at = Column(DateTime, nullable=True)
+    target_parent_profile_id = Column(Integer, ForeignKey("v2_parent_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
 
     circle = sa_relationship("FamilyCircle")
 
@@ -254,6 +258,19 @@ class V2InvitationAttempt(Base):
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     attempted_at = Column(DateTime, nullable=False, index=True)
+
+
+class ParentDisconnectAuditEvent(Base):
+    __tablename__ = "v2_parent_disconnect_audit_events"
+    __table_args__ = (Index("ix_v2_parent_disconnect_circle_created", "family_circle_id", "created_at"),)
+
+    id = Column(Integer, primary_key=True)
+    family_circle_id = Column(Integer, ForeignKey("v2_family_circles.id", ondelete="CASCADE"), nullable=False)
+    organizer_user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    parent_user_id = Column(Integer, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False)
+    parent_profile_id = Column(Integer, ForeignKey("v2_parent_profiles.id", ondelete="RESTRICT"), nullable=False)
+    event_type = Column(String(32), nullable=False, default="disconnect")
+    created_at = Column(DateTime, nullable=False, server_default=func.now())
 
 
 class EscalationRule(Base):

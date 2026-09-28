@@ -4,7 +4,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,8 @@ PUBLIC_INVITATION_CODE_ATTEMPT_WINDOW_MINUTES = 15
 PUBLIC_INVITATION_CODE_ALLOCATION_ATTEMPTS = 20
 ORGANIZER_RECOVERY_MAX_FAILURES = 5
 ORGANIZER_RECOVERY_LOCK_MINUTES = 15
+RELATIONSHIP_AVATAR_MAX_BYTES = 512 * 1024
+RELATIONSHIP_AVATAR_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
 
 def _hash(value: str) -> str:
@@ -116,8 +118,35 @@ def _presented_name(presentation, fallback: str, role_fallback: str | None = Non
     return value
 
 
+def _relationship_avatar_marker(presentation) -> str | None:
+    if presentation and presentation.avatar_blob and presentation.avatar_sha256:
+        return f"relationship-avatar:{presentation.id}:{presentation.avatar_sha256}"
+    return None
+
+
 def _presented_avatar(presentation, fallback: str | None) -> str | None:
+    marker = _relationship_avatar_marker(presentation)
+    if marker:
+        return marker
     return presentation.avatar_url if presentation and presentation.avatar_url else fallback
+
+
+def _validate_relationship_avatar(content_type: str | None, data: bytes) -> str:
+    normalized = (content_type or "").split(";", 1)[0].strip().lower()
+    if normalized not in RELATIONSHIP_AVATAR_MIME_TYPES:
+        raise HTTPException(status_code=415, detail="unsupported avatar image type")
+    if not data:
+        raise HTTPException(status_code=400, detail="avatar image is empty")
+    if len(data) > RELATIONSHIP_AVATAR_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="avatar image is too large")
+    valid_magic = (
+        normalized == "image/jpeg" and data.startswith(b"\xff\xd8\xff")
+        or normalized == "image/png" and data.startswith(b"\x89PNG\r\n\x1a\n")
+        or normalized == "image/webp" and len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+    )
+    if not valid_magic:
+        raise HTTPException(status_code=400, detail="avatar image content does not match its type")
+    return normalized
 
 
 def _offline_setting_response(setting: v2_models.OfflineAlertSetting | None) -> dict:
@@ -158,6 +187,16 @@ def _circle_response(db: Session, circle: v2_models.FamilyCircle, viewer_user_id
             v2_models.FamilyMembership.membership_status == "active",
         ).first()
         membership_role = membership.role if membership is not None else None
+    disconnected_parent_count = db.query(v2_models.ParentProfile).join(
+        v2_models.FamilyMembership,
+        (v2_models.FamilyMembership.family_circle_id == v2_models.ParentProfile.family_circle_id)
+        & (v2_models.FamilyMembership.user_id == v2_models.ParentProfile.user_id),
+    ).filter(
+        v2_models.ParentProfile.family_circle_id == circle.id,
+        v2_models.ParentProfile.active.is_(False),
+        v2_models.FamilyMembership.role == "PARENT",
+        v2_models.FamilyMembership.membership_status.in_(("disconnected", "left")),
+    ).count()
     return {
         "id": circle.id,
         "organizer_user_id": circle.organizer_user_id,
@@ -165,6 +204,7 @@ def _circle_response(db: Session, circle: v2_models.FamilyCircle, viewer_user_id
         "member_count": count,
         "organizer_name": organizer.name if organizer else "",
         "membership_role": membership_role,
+        "parent_reconnect_available": disconnected_parent_count == 1,
     }
 
 
@@ -493,15 +533,37 @@ def update_offline_alert_settings_v2(
     return _offline_setting_response(setting)
 
 
+def _parent_reconnect_target(db: Session, circle_id: int) -> v2_models.ParentProfile | None:
+    active_profiles = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.family_circle_id == circle_id,
+        v2_models.ParentProfile.active.is_(True),
+    ).all()
+    if len(active_profiles) > 1:
+        raise HTTPException(status_code=409, detail="family has multiple active parent profiles")
+    if len(active_profiles) == 1:
+        return active_profiles[0]
+
+    disconnected_profiles = db.query(v2_models.ParentProfile).join(
+        v2_models.FamilyMembership,
+        (v2_models.FamilyMembership.family_circle_id == v2_models.ParentProfile.family_circle_id)
+        & (v2_models.FamilyMembership.user_id == v2_models.ParentProfile.user_id),
+    ).filter(
+        v2_models.ParentProfile.family_circle_id == circle_id,
+        v2_models.ParentProfile.active.is_(False),
+        v2_models.FamilyMembership.role == "PARENT",
+        v2_models.FamilyMembership.membership_status.in_(("disconnected", "left")),
+    ).all()
+    if len(disconnected_profiles) > 1:
+        raise HTTPException(status_code=409, detail="family has multiple disconnected parent profiles")
+    return disconnected_profiles[0] if disconnected_profiles else None
+
+
 @router.post("/family-circles/{circle_id}/invitations", response_model=schemas.InvitationResponse)
 def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
     circle = _circle(db, circle_id)
     _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
-    active_parent_count = db.query(v2_models.ParentProfile).filter(
-        v2_models.ParentProfile.family_circle_id == circle.id,
-        v2_models.ParentProfile.active.is_(True),
-    ).count()
-    purpose = "PARENT_RECONNECT" if payload.role == "PARENT" and active_parent_count == 1 else "PARENT_CONNECT"
+    reconnect_target = _parent_reconnect_target(db, circle.id) if payload.role == "PARENT" else None
+    purpose = "PARENT_RECONNECT" if reconnect_target is not None else "PARENT_CONNECT"
     token = ""
     public_code = ""
     invitation = None
@@ -515,6 +577,7 @@ def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, 
             invited_role=payload.role,
             invited_relationship=payload.relationship,
             purpose=purpose,
+            target_parent_profile_id=reconnect_target.id if reconnect_target else None,
             invited_by_user_id=current_user.id,
             expires_at=utc_now() + timedelta(hours=payload.expires_in_hours),
             status="pending",
@@ -528,8 +591,6 @@ def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, 
             invitation = candidate_invitation
             break
         except IntegrityError:
-            # A code collision must never overwrite or retarget an invitation.
-            # Retry with a new independently generated token and code.
             continue
     if invitation is None:
         db.rollback()
@@ -544,6 +605,30 @@ def create_invitation(circle_id: int, payload: schemas.InvitationCreateRequest, 
         "expires_at": invitation.expires_at,
         "purpose": invitation.purpose,
     }
+
+
+def _merge_parent_presentations_for_rebind(db: Session, circle_id: int, old_user_id: int, new_user_id: int) -> None:
+    if old_user_id == new_user_id:
+        return
+    presentations = db.query(v2_models.RelationshipPresentation).filter(
+        v2_models.RelationshipPresentation.family_circle_id == circle_id,
+        v2_models.RelationshipPresentation.subject_user_id == old_user_id,
+    ).all()
+    for presentation in presentations:
+        destination = _presentation(db, circle_id, presentation.viewer_user_id, new_user_id)
+        if destination is None:
+            presentation.subject_user_id = new_user_id
+            continue
+        if not destination.display_name and presentation.display_name:
+            destination.display_name = presentation.display_name
+        if not destination.avatar_blob and presentation.avatar_blob:
+            destination.avatar_blob = presentation.avatar_blob
+            destination.avatar_mime_type = presentation.avatar_mime_type
+            destination.avatar_sha256 = presentation.avatar_sha256
+            destination.avatar_url = presentation.avatar_url
+        elif not destination.avatar_url and presentation.avatar_url:
+            destination.avatar_url = presentation.avatar_url
+        db.delete(presentation)
 
 
 def _accept_parent_reconnect(invitation, current_user: models.User, db: Session):
@@ -562,49 +647,80 @@ def _accept_parent_reconnect(invitation, current_user: models.User, db: Session)
         v2_models.FamilyMembership.membership_status == "active",
     ).first() is not None:
         raise HTTPException(status_code=409, detail="parent reconnect requires an unpaired identity")
-    active_profiles = db.query(v2_models.ParentProfile).filter(
-        v2_models.ParentProfile.family_circle_id == invitation.family_circle_id,
-        v2_models.ParentProfile.active.is_(True),
-    ).all()
-    if len(active_profiles) != 1:
-        raise HTTPException(status_code=409, detail="parent reconnect requires exactly one active parent")
-    old_profile = active_profiles[0]
+
+    if invitation.target_parent_profile_id is not None:
+        old_profile = db.get(v2_models.ParentProfile, invitation.target_parent_profile_id)
+        if old_profile is None or old_profile.family_circle_id != invitation.family_circle_id:
+            raise HTTPException(status_code=409, detail="parent reconnect target is unavailable")
+    else:
+        active_profiles = db.query(v2_models.ParentProfile).filter(
+            v2_models.ParentProfile.family_circle_id == invitation.family_circle_id,
+            v2_models.ParentProfile.active.is_(True),
+        ).all()
+        if len(active_profiles) != 1:
+            raise HTTPException(status_code=409, detail="parent reconnect requires exactly one active parent")
+        old_profile = active_profiles[0]
+
     old_membership = db.query(v2_models.FamilyMembership).filter(
         v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
         v2_models.FamilyMembership.user_id == old_profile.user_id,
         v2_models.FamilyMembership.role == "PARENT",
-        v2_models.FamilyMembership.membership_status == "active",
+        v2_models.FamilyMembership.membership_status.in_(("active", "disconnected", "left")),
     ).first()
     if old_membership is None:
-        raise HTTPException(status_code=409, detail="parent reconnect requires an active original parent")
-    current_profile = db.query(v2_models.ParentProfile).filter(
+        raise HTTPException(status_code=409, detail="parent reconnect requires an original parent membership")
+
+    conflicting_profile = db.query(v2_models.ParentProfile).filter(
         v2_models.ParentProfile.user_id == current_user.id,
-        v2_models.ParentProfile.active.is_(True),
+        v2_models.ParentProfile.id != old_profile.id,
     ).first()
-    if current_profile is not None:
-        raise HTTPException(status_code=409, detail="parent reconnect identity already owns a parent profile")
+    if conflicting_profile is not None:
+        raise HTTPException(status_code=409, detail="parent reconnect identity already owns another parent profile")
+
     old_user = db.get(models.User, old_profile.user_id)
+    if old_user is None:
+        raise HTTPException(status_code=409, detail="parent reconnect original user is unavailable")
     now = utc_now()
-    old_membership.membership_status = "replaced"
-    membership = v2_models.FamilyMembership(
-        family_circle_id=invitation.family_circle_id,
-        user_id=current_user.id,
-        role="PARENT",
-        relationship=invitation.invited_relationship,
-        membership_status="active",
-    )
-    db.add(membership)
-    db.flush()
-    old_user.api_token_hash = None
-    old_user.fcm_token = None
-    old_user.fcm_token_invalidated_at = now
-    old_user.device_id = f"replaced-parent-{old_user.id}-{uuid4().hex}"
-    for old_token in db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == old_user.id).all():
-        old_token.push_token_invalidated_at = now
-    db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == old_user.id).delete(synchronize_session=False)
-    # Keep the original profile row and therefore all check-in/help history.
-    old_profile.user_id = current_user.id
-    current_user.recovery_device_id = None
+
+    if old_user.id == current_user.id:
+        old_membership.membership_status = "active"
+        old_profile.active = True
+        current_user.recovery_device_id = None
+        membership = old_membership
+    else:
+        existing_current_membership = db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id == invitation.family_circle_id,
+            v2_models.FamilyMembership.user_id == current_user.id,
+        ).first()
+        if existing_current_membership is None:
+            membership = v2_models.FamilyMembership(
+                family_circle_id=invitation.family_circle_id,
+                user_id=current_user.id,
+                role="PARENT",
+                relationship=invitation.invited_relationship,
+                membership_status="active",
+            )
+            db.add(membership)
+            db.flush()
+        else:
+            existing_current_membership.role = "PARENT"
+            existing_current_membership.relationship = invitation.invited_relationship
+            existing_current_membership.membership_status = "active"
+            membership = existing_current_membership
+
+        old_membership.membership_status = "replaced"
+        old_user.api_token_hash = None
+        old_user.fcm_token = None
+        old_user.fcm_token_invalidated_at = now
+        old_user.device_id = f"replaced-parent-{old_user.id}-{uuid4().hex}"
+        for old_token in db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == old_user.id).all():
+            old_token.push_token_invalidated_at = now
+        db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == old_user.id).delete(synchronize_session=False)
+        _merge_parent_presentations_for_rebind(db, invitation.family_circle_id, old_user.id, current_user.id)
+        old_profile.user_id = current_user.id
+        old_profile.active = True
+        current_user.recovery_device_id = None
+
     invitation.status = "accepted"
     invitation.accepted_by_user_id = current_user.id
     invitation.accepted_at = now
@@ -796,6 +912,50 @@ def remove_member(circle_id: int, membership_id: int, current_user: models.User 
         profile.active = False
     db.commit()
     return {"success": True, "status": "removed"}
+
+
+@router.post("/family-circles/{circle_id}/parent/disconnect", response_model=schemas.ActionResponse)
+def disconnect_parent(circle_id: int, current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
+    circle = _circle(db, circle_id)
+    _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
+    active_memberships = db.query(v2_models.FamilyMembership).filter(
+        v2_models.FamilyMembership.family_circle_id == circle.id,
+        v2_models.FamilyMembership.role == "PARENT",
+        v2_models.FamilyMembership.membership_status == "active",
+    ).all()
+    active_profiles = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.family_circle_id == circle.id,
+        v2_models.ParentProfile.active.is_(True),
+    ).all()
+    if not active_memberships and not active_profiles:
+        return {"success": True, "status": "parent_disconnected"}
+    if len(active_memberships) != 1 or len(active_profiles) != 1:
+        raise HTTPException(status_code=409, detail="family must have exactly one active parent to disconnect")
+    membership = active_memberships[0]
+    profile = active_profiles[0]
+    if profile.user_id != membership.user_id:
+        raise HTTPException(status_code=409, detail="active parent membership/profile mismatch")
+
+    parent_user = db.get(models.User, membership.user_id)
+    if parent_user is None:
+        raise HTTPException(status_code=409, detail="active parent user is unavailable")
+    now = utc_now()
+    membership.membership_status = "disconnected"
+    profile.active = False
+    parent_user.fcm_token = None
+    parent_user.fcm_token_invalidated_at = now
+    for token in db.query(models.DevicePushToken).filter(models.DevicePushToken.user_id == parent_user.id).all():
+        token.push_token_invalidated_at = now
+    db.query(models.DeviceStatus).filter(models.DeviceStatus.user_id == parent_user.id).delete(synchronize_session=False)
+    db.add(v2_models.ParentDisconnectAuditEvent(
+        family_circle_id=circle.id,
+        organizer_user_id=current_user.id,
+        parent_user_id=parent_user.id,
+        parent_profile_id=profile.id,
+        event_type="disconnect",
+    ))
+    db.commit()
+    return {"success": True, "status": "parent_disconnected"}
 
 
 @router.post("/family-circles/{circle_id}/leave", response_model=schemas.ActionResponse)
@@ -1046,9 +1206,9 @@ def _parent_status(profile: v2_models.ParentProfile, db: Session, now: datetime)
         "battery_level": device.battery_level if device else (latest.battery_level if latest else None),
         "last_online_utc": device.last_online_time if device else None,
         "current_local": localize_utc(now, profile.timezone).isoformat(),
-        "organizer_name": _presented_name(parent_view, organizer.name if organizer else "Family manager", "Family manager"),
+        "organizer_name": _presented_name(None, organizer.name if organizer else "Family manager", "Family manager"),
         "organizer_phone": organizer.phone if organizer else None,
-        "organizer_avatar_url": _presented_avatar(parent_view, organizer.avatar_url if organizer else None),
+        "organizer_avatar_url": organizer.avatar_url if organizer else None,
     }
 
 
@@ -1157,6 +1317,102 @@ def check_parent_now(circle_id: int, parent_id: int, current_user: models.User =
     )
     db.commit()
     return {"success": True, "status": f"queued:{queued}"}
+
+
+def _organizer_parent_profile(
+    db: Session,
+    circle_id: int,
+    parent_id: int,
+    organizer_user_id: int,
+    *,
+    create_presentation: bool = False,
+) -> tuple[v2_models.ParentProfile, models.User, v2_models.RelationshipPresentation | None]:
+    _circle(db, circle_id)
+    _active_membership(db, organizer_user_id, circle_id, ("ORGANIZER",))
+    profile = db.query(v2_models.ParentProfile).filter(
+        v2_models.ParentProfile.id == parent_id,
+        v2_models.ParentProfile.family_circle_id == circle_id,
+        v2_models.ParentProfile.active.is_(True),
+    ).first()
+    if profile is None:
+        raise HTTPException(status_code=404, detail="parent not found")
+    parent = db.get(models.User, profile.user_id)
+    if parent is None:
+        raise HTTPException(status_code=404, detail="parent user not found")
+    presentation = _presentation(db, circle_id, organizer_user_id, parent.id)
+    if presentation is None and create_presentation:
+        presentation = v2_models.RelationshipPresentation(
+            family_circle_id=circle_id,
+            viewer_user_id=organizer_user_id,
+            subject_user_id=parent.id,
+        )
+        db.add(presentation)
+        db.flush()
+    return profile, parent, presentation
+
+
+@router.put(
+    "/family-circles/{circle_id}/parents/{parent_id}/presentation-avatar",
+    response_model=schemas.RelationshipAvatarResponse,
+)
+async def upload_parent_presentation_avatar(
+    circle_id: int,
+    parent_id: int,
+    file: UploadFile = File(...),
+    current_user: models.User = Depends(get_v2_current_user),
+    db: Session = Depends(get_db),
+):
+    _, _, presentation = _organizer_parent_profile(
+        db, circle_id, parent_id, current_user.id, create_presentation=True
+    )
+    assert presentation is not None
+    data = await file.read(RELATIONSHIP_AVATAR_MAX_BYTES + 1)
+    content_type = _validate_relationship_avatar(file.content_type, data)
+    digest = hashlib.sha256(data).hexdigest()
+    presentation.avatar_blob = data
+    presentation.avatar_mime_type = content_type
+    presentation.avatar_sha256 = digest
+    presentation.avatar_url = f"relationship-avatar:{presentation.id}:{digest}"
+    db.commit()
+    return {"avatar_url": presentation.avatar_url, "sha256": digest}
+
+
+@router.get("/family-circles/{circle_id}/parents/{parent_id}/presentation-avatar")
+def get_parent_presentation_avatar(
+    circle_id: int,
+    parent_id: int,
+    current_user: models.User = Depends(get_v2_current_user),
+    db: Session = Depends(get_db),
+):
+    _, _, presentation = _organizer_parent_profile(db, circle_id, parent_id, current_user.id)
+    if presentation is None or not presentation.avatar_blob or not presentation.avatar_mime_type:
+        raise HTTPException(status_code=404, detail="parent presentation avatar not found")
+    return Response(
+        content=presentation.avatar_blob,
+        media_type=presentation.avatar_mime_type,
+        headers={
+            "ETag": presentation.avatar_sha256 or "",
+            "Cache-Control": "private, max-age=86400",
+        },
+    )
+
+
+@router.delete("/family-circles/{circle_id}/parents/{parent_id}/presentation-avatar", response_model=schemas.ActionResponse)
+def delete_parent_presentation_avatar(
+    circle_id: int,
+    parent_id: int,
+    current_user: models.User = Depends(get_v2_current_user),
+    db: Session = Depends(get_db),
+):
+    _, _, presentation = _organizer_parent_profile(db, circle_id, parent_id, current_user.id)
+    if presentation is None:
+        return {"success": True, "status": "avatar_removed"}
+    presentation.avatar_blob = None
+    presentation.avatar_mime_type = None
+    presentation.avatar_sha256 = None
+    presentation.avatar_url = None
+    db.commit()
+    return {"success": True, "status": "avatar_removed"}
 
 
 @router.put("/family-circles/{circle_id}/parents/{parent_id}/profile", response_model=schemas.V2CurrentUserResponse)
