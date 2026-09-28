@@ -41,12 +41,11 @@ def upgrade() -> None:
     if "target_parent_profile_id" not in invitation_columns:
         op.add_column(
             "v2_family_invitations",
-            sa.Column(
-                "target_parent_profile_id",
-                sa.Integer(),
-                sa.ForeignKey("v2_parent_profiles.id", ondelete="SET NULL"),
-                nullable=True,
-            ),
+            # SQLite cannot ALTER an existing table to add a foreign-key
+            # constraint.  Keep this nullable scalar column migration-safe; the
+            # application resolves and validates the target profile inside the
+            # same family before reconnecting.
+            sa.Column("target_parent_profile_id", sa.Integer(), nullable=True),
         )
     op.create_index(
         "ix_v2_invitation_target_parent_profile",
