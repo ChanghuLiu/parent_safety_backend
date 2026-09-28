@@ -82,6 +82,32 @@ def _entitlement_response(entitlement: v2_models.PurchaseEntitlement) -> dict:
     }
 
 
+def _can_rebind_deleted_account_entitlement(
+    db: Session,
+    entitlement: v2_models.PurchaseEntitlement,
+) -> bool:
+    """Return True only when the previous organizer account was irreversibly deleted.
+
+    This is deliberately stricter than a normal revocation/cancellation.  It lets a
+    still-owned Play purchase be restored to a newly created caregiver account after
+    the user explicitly deleted the old Parent Check-In account, without making active
+    or suspended cross-account purchases transferable.
+    """
+    if entitlement.revoked_at is None:
+        return False
+    old_circle = db.get(v2_models.FamilyCircle, entitlement.family_circle_id)
+    old_user = db.get(models.User, entitlement.organizer_user_id)
+    if old_circle is None or old_user is None:
+        return False
+    return (
+        old_circle.status == "deleted"
+        and old_user.api_token_hash is None
+        and old_user.organizer_recovery_verifier is None
+        and old_user.recovery_device_id is None
+        and old_user.device_id == f"deleted-{old_user.id}"
+    )
+
+
 def _restore_circle_for_user(db: Session, current_user: models.User) -> v2_models.FamilyCircle:
     """Resolve the only server-authorized caregiver target for a restore.
 
@@ -167,15 +193,26 @@ def _verify_and_apply(
     ).with_for_update().first()
     if restore and current_user.role != "family_member":
         raise HTTPException(status_code=403, detail="only a caregiver can restore a family purchase")
+    rebind_deleted_account = False
     if existing is not None and existing.organizer_user_id != current_user.id:
-        # A Play account can be present on more than one backend account.  An
-        # already-bound purchase is not transferable merely because the token
-        # was returned by Google for this device/account.
-        raise HTTPException(status_code=409, detail=PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT)
+        # A normal active/suspended binding is never transferable.  The sole
+        # exception is an explicitly deleted organizer account: Google still owns
+        # the lifetime purchase, so Restore purchase must be able to bind it to the
+        # newly created caregiver account instead of stranding the purchase forever.
+        if restore and _can_rebind_deleted_account_entitlement(db, existing):
+            rebind_deleted_account = True
+        else:
+            raise HTTPException(status_code=409, detail=PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT)
     if existing is not None and existing.obfuscated_account_hash and purchase.obfuscated_account_id and _token_hash(purchase.obfuscated_account_id) != existing.obfuscated_account_hash:
         raise HTTPException(status_code=403, detail="purchase attribution mismatch")
 
     circle = None
+    if rebind_deleted_account:
+        circle = _restore_circle_for_user(db, current_user)
+        existing.family_circle_id = circle.id
+        existing.organizer_user_id = current_user.id
+        existing.source = "deleted_account_rebind"
+        existing.obfuscated_account_hash = _token_hash(purchase.obfuscated_account_id) if purchase.obfuscated_account_id else None
     if payload.family_circle_id is not None and not restore:
         circle = circle or _circle_any(db, payload.family_circle_id)
         _active_membership(db, current_user.id, circle.id, ("ORGANIZER",))
@@ -188,7 +225,7 @@ def _verify_and_apply(
     elif existing is None and restore:
         circle = _restore_circle_for_user(db, current_user)
 
-    restore_audit_result = None
+    restore_audit_result = "rebound_after_account_deletion" if rebind_deleted_account else None
     if existing is None:
         try:
             encrypted_token = encrypt_purchase_token(payload.purchase_token)
@@ -225,7 +262,8 @@ def _verify_and_apply(
         existing.purchased_at = existing.purchased_at or purchase.purchased_at
         if restore and not getattr(existing, "source", None):
             existing.source = "verified_orphan_recovery"
-        restore_audit_result = "idempotent" if restore else None
+        if restore and restore_audit_result is None:
+            restore_audit_result = "idempotent"
     circle = circle or _circle_any(db, existing.family_circle_id)
     if purchase_state == "PURCHASED":
         existing.verification_state = "VERIFIED"
@@ -398,6 +436,12 @@ def process_rtdn(payload: RtdnRequest, db: Session, verifier: GooglePlayVerifier
         db.commit()
         return "unassigned"
     purchase = verifier.get_purchase(payload.purchase_token)
+    if _can_rebind_deleted_account_entitlement(db, entitlement):
+        entitlement.last_verified_at = utc_now()
+        event.status = "ignored_deleted_account"
+        event.processed_at = utc_now()
+        db.commit()
+        return "ignored_deleted_account"
     if purchase.package_name != PACKAGE_NAME or purchase.product_id != PRODUCT_ID:
         event.status = "invalid"
         event.processed_at = utc_now()

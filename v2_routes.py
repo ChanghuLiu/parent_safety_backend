@@ -1019,6 +1019,7 @@ def delete_my_v2_account(current_user: models.User = Depends(get_v2_current_user
         ).all()
         for entitlement in entitlements:
             entitlement.revoked_at = now
+            entitlement.source = "account_deleted"
             entitlement.purchase_token_ciphertext = None
             entitlement.obfuscated_account_hash = None
 

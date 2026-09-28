@@ -334,3 +334,94 @@ def test_orphan_restore_concurrent_claim_has_one_owner(billing_api):
             first_user["user_id"],
             second_user["user_id"],
         }
+
+
+def test_deleted_organizer_purchase_can_be_rebound_but_active_cross_account_cannot(billing_api):
+    client, database, verifier = billing_api
+    original, original_headers, original_circle_id = _pending_circle(client)
+    token = "deleted-owner-rebind-token"
+    assert client.post(
+        "/api/v2/billing/google/verify",
+        headers=original_headers,
+        json=_verify_payload(token, original_circle_id),
+    ).status_code == 200
+
+    # Active cross-account use remains blocked.
+    _, active_other_headers = _register(client, "FAMILY_MEMBER", "Other", "active-other-device")
+    active_other_circle = client.post(
+        "/api/v2/family-circles",
+        headers=active_other_headers,
+        json={"name": "Other family"},
+    )
+    assert active_other_circle.status_code == 200
+    blocked = client.post(
+        "/api/v2/billing/google/restore",
+        headers=active_other_headers,
+        json=_verify_payload(token, active_other_circle.json()["id"]),
+    )
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "PURCHASE_BELONGS_TO_ANOTHER_ACCOUNT"
+
+    # Once the original organizer explicitly deletes the account, the same still-owned
+    # Google Play purchase can fund a new caregiver account instead of being stranded.
+    deleted = client.delete("/api/v2/users/me", headers=original_headers)
+    assert deleted.status_code == 200, deleted.text
+
+    replacement, replacement_headers = _register(client, "FAMILY_MEMBER", "Replacement", "replacement-device")
+    replacement_circle = client.post(
+        "/api/v2/family-circles",
+        headers=replacement_headers,
+        json={"name": "Replacement family"},
+    )
+    assert replacement_circle.status_code == 200
+    restored = client.post(
+        "/api/v2/billing/google/restore",
+        headers=replacement_headers,
+        json=_verify_payload(token, replacement_circle.json()["id"]),
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["organizer_user_id"] == replacement["user_id"]
+    assert restored.json()["family_circle_id"] == replacement_circle.json()["id"]
+
+    with database.SessionLocal() as db:
+        from v2_models import BillingAuditEvent, FamilyCircle, PurchaseEntitlement
+        entitlement = db.query(PurchaseEntitlement).one()
+        assert entitlement.organizer_user_id == replacement["user_id"]
+        assert entitlement.family_circle_id == replacement_circle.json()["id"]
+        assert entitlement.revoked_at is None
+        assert entitlement.verification_state == "VERIFIED"
+        assert entitlement.source == "deleted_account_rebind"
+        assert db.get(FamilyCircle, original_circle_id).status == "deleted"
+        assert db.query(BillingAuditEvent).filter(
+            BillingAuditEvent.event_type == "google_purchase_restore",
+            BillingAuditEvent.result == "rebound_after_account_deletion",
+        ).count() == 1
+
+
+def test_rtdn_does_not_reactivate_explicitly_deleted_account(billing_api):
+    client, database, verifier = billing_api
+    _, headers, circle_id = _pending_circle(client)
+    token = "deleted-owner-rtdn-token"
+    assert client.post(
+        "/api/v2/billing/google/verify",
+        headers=headers,
+        json=_verify_payload(token, circle_id),
+    ).status_code == 200
+    assert client.delete("/api/v2/users/me", headers=headers).status_code == 200
+
+    import v2_billing
+    with database.SessionLocal() as db:
+        result = v2_billing.process_rtdn(
+            v2_billing.RtdnRequest(
+                message_id="deleted-owner-rtdn",
+                notification_type="ONE_TIME_PRODUCT_PURCHASED",
+                purchase_token=token,
+            ),
+            db,
+            verifier,
+        )
+        assert result == "ignored_deleted_account"
+        from v2_models import FamilyCircle, PurchaseEntitlement
+        entitlement = db.query(PurchaseEntitlement).one()
+        assert db.get(FamilyCircle, circle_id).status == "deleted"
+        assert entitlement.revoked_at is not None
