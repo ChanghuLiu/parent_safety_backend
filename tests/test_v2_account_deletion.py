@@ -143,18 +143,65 @@ def test_parent_account_deletion_is_atomic_and_allows_safe_re_registration(v2_ap
     assert new_token.status_code == 200, new_token.text
 
 
-def test_caregiver_deletion_requires_circle_resolution_and_is_safe_without_circle(v2_api):
+def test_caregiver_account_deletion_closes_owned_circle_and_is_safe_without_circle(v2_api):
     client, database = v2_api
-    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Organizer", "delete-organizer-device")
-    blocked_circle = client.post(
-        "/api/v2/family-circles",
-        headers=organizer_headers,
-        json={"name": "Owned Circle"},
+    parent, parent_headers, organizer, organizer_headers, circle_id = _active_parent_fixture(
+        client, database, "delete-organizer-family"
     )
-    assert blocked_circle.status_code == 200
-    blocked = client.delete("/api/v2/users/me", headers=organizer_headers)
-    assert blocked.status_code == 409
-    assert client.get("/api/v2/users/me", headers=organizer_headers).status_code == 200
+
+    from models import User
+    from v2_models import FamilyCircle, FamilyMembership, ParentProfile, PurchaseEntitlement
+    with database.SessionLocal() as db:
+        db.add(PurchaseEntitlement(
+            family_circle_id=circle_id,
+            organizer_user_id=organizer["user_id"],
+            product_id="parent_checkin_family_lifetime",
+            package_name="com.parent.safety.check",
+            purchase_token_hash="delete-organizer-purchase-token",
+            purchase_token_ciphertext="encrypted-token",
+            purchase_state="PURCHASED",
+            verification_state="VERIFIED",
+            acknowledgement_state="ACKNOWLEDGED",
+            obfuscated_account_hash="account-hash",
+        ))
+        db.commit()
+
+    deleted_organizer = client.delete("/api/v2/users/me", headers=organizer_headers)
+    assert deleted_organizer.status_code == 200, deleted_organizer.text
+    assert deleted_organizer.json() == {"success": True, "status": "deleted"}
+    assert client.get("/api/v2/users/me", headers=organizer_headers).status_code == 401
+    # The Parent account still exists, but the deleted organizer's family is no longer active.
+    assert client.get("/api/v2/users/me", headers=parent_headers).status_code == 200
+
+    with database.SessionLocal() as db:
+        user = db.get(User, organizer["user_id"])
+        circle = db.get(FamilyCircle, circle_id)
+        organizer_membership = db.query(FamilyMembership).filter(
+            FamilyMembership.family_circle_id == circle_id,
+            FamilyMembership.user_id == organizer["user_id"],
+        ).one()
+        parent_membership = db.query(FamilyMembership).filter(
+            FamilyMembership.family_circle_id == circle_id,
+            FamilyMembership.user_id == parent["user_id"],
+        ).one()
+        profile = db.query(ParentProfile).filter(ParentProfile.family_circle_id == circle_id).one()
+        entitlement = db.query(PurchaseEntitlement).filter(PurchaseEntitlement.family_circle_id == circle_id).one()
+        assert circle.status == "deleted"
+        assert organizer_membership.membership_status == "deleted"
+        assert parent_membership.membership_status == "removed"
+        assert profile.active is False
+        assert user.api_token_hash is None
+        assert user.organizer_recovery_verifier is None
+        assert user.recovery_device_id is None
+        assert entitlement.revoked_at is not None
+        assert entitlement.purchase_token_ciphertext is None
+        assert entitlement.obfuscated_account_hash is None
+
+    recovery = client.post(
+        "/api/v2/organizer/recover",
+        json={"device_id": "delete-organizer-family-organizer", "recovery_code": organizer["recovery_code"]},
+    )
+    assert recovery.status_code == 409
 
     disposable, disposable_headers = _register(client, "FAMILY_MEMBER", "Disposable", "delete-no-circle-device")
     deleted = client.delete("/api/v2/users/me", headers=disposable_headers)
@@ -168,7 +215,6 @@ def test_caregiver_deletion_requires_circle_resolution_and_is_safe_without_circl
 
     with database.SessionLocal() as db:
         from sqlalchemy import text
-
         assert db.execute(text("PRAGMA integrity_check")).scalar() == "ok"
 
 

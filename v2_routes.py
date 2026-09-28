@@ -985,13 +985,43 @@ def delete_circle(circle_id: int, current_user: models.User = Depends(get_v2_cur
 
 @router.delete("/users/me", response_model=schemas.ActionResponse)
 def delete_my_v2_account(current_user: models.User = Depends(get_v2_current_user), db: Session = Depends(get_db)):
-    organizer_circle = db.query(v2_models.FamilyMembership).filter(
+    """Permanently close the authenticated V2 account.
+
+    An organizer deletion also closes circles they still own so the in-app
+    Delete Account action is complete and atomic instead of failing with a
+    hidden 409. Parent accounts keep the existing per-user deletion behavior.
+    """
+    now = utc_now()
+    organizer_memberships = db.query(v2_models.FamilyMembership).filter(
         v2_models.FamilyMembership.user_id == current_user.id,
         v2_models.FamilyMembership.role == "ORGANIZER",
         v2_models.FamilyMembership.membership_status == "active",
-    ).first()
-    if organizer_circle is not None:
-        raise HTTPException(status_code=409, detail="delete or transfer organizer circles before deleting the account")
+    ).all()
+    owned_circle_ids = [membership.family_circle_id for membership in organizer_memberships]
+    if owned_circle_ids:
+        db.query(v2_models.FamilyCircle).filter(
+            v2_models.FamilyCircle.id.in_(owned_circle_ids)
+        ).update({"status": "deleted"}, synchronize_session=False)
+        db.query(v2_models.FamilyMembership).filter(
+            v2_models.FamilyMembership.family_circle_id.in_(owned_circle_ids)
+        ).update({"membership_status": "removed"}, synchronize_session=False)
+        db.query(v2_models.ParentProfile).filter(
+            v2_models.ParentProfile.family_circle_id.in_(owned_circle_ids)
+        ).update({"active": False}, synchronize_session=False)
+        db.query(v2_models.RelationshipPresentation).filter(
+            v2_models.RelationshipPresentation.family_circle_id.in_(owned_circle_ids)
+        ).delete(synchronize_session=False)
+        # A deleted organizer account must never be resurrected by a previously
+        # verified Play purchase. Keep only the token hash/audit metadata needed
+        # for anti-replay, while removing recoverable purchase/account data.
+        entitlements = db.query(v2_models.PurchaseEntitlement).filter(
+            v2_models.PurchaseEntitlement.organizer_user_id == current_user.id
+        ).all()
+        for entitlement in entitlements:
+            entitlement.revoked_at = now
+            entitlement.purchase_token_ciphertext = None
+            entitlement.obfuscated_account_hash = None
+
     profiles = db.query(v2_models.ParentProfile).filter(v2_models.ParentProfile.user_id == current_user.id).all()
     profile_ids = [profile.id for profile in profiles]
     if profile_ids:
@@ -1004,15 +1034,19 @@ def delete_my_v2_account(current_user: models.User = Depends(get_v2_current_user
     db.query(v2_models.V2NotificationDelivery).filter(
         v2_models.V2NotificationDelivery.recipient_user_id == current_user.id
     ).delete(synchronize_session=False)
-    # Keep the user as an audit tombstone while invalidating every
-    # authentication and notification credential.  User has no generic
-    # `invalidated_at` column; this existing field is the account's FCM
-    # invalidation marker and is also used by the token-registration flow.
     current_user.fcm_token = None
-    current_user.fcm_token_invalidated_at = utc_now()
+    current_user.fcm_token_invalidated_at = now
     current_user.api_token_hash = None
+    current_user.organizer_recovery_verifier = None
+    current_user.organizer_recovery_created_at = None
+    current_user.organizer_recovery_used_at = None
+    current_user.organizer_recovery_failed_attempts = 0
+    current_user.organizer_recovery_locked_until = None
+    current_user.organizer_recovery_one_time = False
+    current_user.recovery_device_id = None
     current_user.name = "Deleted user"
     current_user.phone = ""
+    current_user.avatar_url = None
     current_user.device_id = f"deleted-{current_user.id}"
     current_user.locale_tag = None
     db.commit()
