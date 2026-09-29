@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -28,6 +29,51 @@ ORGANIZER_RECOVERY_LOCK_MINUTES = 15
 RELATIONSHIP_AVATAR_MAX_BYTES = 512 * 1024
 RELATIONSHIP_AVATAR_MIME_TYPES = {"image/jpeg", "image/png", "image/webp"}
 
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise RuntimeError(f"{name} must be >= 1")
+    return value
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be a boolean")
+
+
+def _app_version_policy() -> schemas.AppVersionPolicyResponse:
+    latest = _env_int("ANDROID_LATEST_VERSION_CODE", 11)
+    child_min = _env_int("ANDROID_CHILD_MIN_VERSION_CODE", latest)
+    parent_min = _env_int("ANDROID_PARENT_MIN_VERSION_CODE", latest)
+    parent_force = _env_bool("ANDROID_PARENT_FORCE_UPDATE", False)
+    # Refuse an impossible policy that would force users to a version the
+    # server itself does not advertise as available.
+    if child_min > latest:
+        raise RuntimeError("ANDROID_CHILD_MIN_VERSION_CODE cannot exceed ANDROID_LATEST_VERSION_CODE")
+    if parent_min > latest:
+        raise RuntimeError("ANDROID_PARENT_MIN_VERSION_CODE cannot exceed ANDROID_LATEST_VERSION_CODE")
+    return schemas.AppVersionPolicyResponse(
+        latest_version_code=latest,
+        child_min_version_code=child_min,
+        child_force_update=True,
+        parent_force_update=parent_force,
+        parent_min_version_code=parent_min,
+    )
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -207,6 +253,11 @@ def _circle_response(db: Session, circle: v2_models.FamilyCircle, viewer_user_id
         "parent_reconnect_available": disconnected_parent_count == 1,
     }
 
+
+
+@router.get("/app-version-policy", response_model=schemas.AppVersionPolicyResponse)
+def get_app_version_policy():
+    return _app_version_policy()
 
 @router.post("/register", response_model=schemas.V2RegisterResponse)
 def register_v2(payload: schemas.V2RegisterRequest, db: Session = Depends(get_db)):

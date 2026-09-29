@@ -245,3 +245,11 @@ class EscalationRuleRequest(BaseModel):
     priority: int = Field(ge=1, le=20)
     delay_minutes: int = Field(default=30, ge=1, le=10080)
     enabled: bool = True
+
+
+class AppVersionPolicyResponse(BaseModel):
+    latest_version_code: int = Field(ge=1)
+    child_min_version_code: int = Field(ge=1)
+    child_force_update: bool = True
+    parent_force_update: bool = False
+    parent_min_version_code: int = Field(ge=1)
