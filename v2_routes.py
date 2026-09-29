@@ -61,12 +61,11 @@ def _app_version_policy() -> schemas.AppVersionPolicyResponse:
     # Family managers always follow the newest production version. There is
     # intentionally no switch/minimum override that can weaken this rule.
     child_min = latest
-    parent_min = _env_int("ANDROID_PARENT_MIN_VERSION_CODE", latest)
+    # Parents are normally not forced. When the switch is enabled, they are
+    # forced to the same latest published version as family managers. There is
+    # intentionally no independent parent minimum that can drift out of sync.
     parent_force = _env_bool("ANDROID_PARENT_FORCE_UPDATE", False)
-    # Parent forcing is opt-in, but when enabled it must still target a version
-    # that has already been published.
-    if parent_min > latest:
-        raise RuntimeError("ANDROID_PARENT_MIN_VERSION_CODE cannot exceed ANDROID_LATEST_VERSION_CODE")
+    parent_min = latest
     return schemas.AppVersionPolicyResponse(
         latest_version_code=latest,
         child_min_version_code=child_min,

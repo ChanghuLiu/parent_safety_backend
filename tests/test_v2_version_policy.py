@@ -37,7 +37,7 @@ def test_child_min_defaults_to_latest_and_parent_switch_can_be_enabled(monkeypat
     )
     assert policy.child_min_version_code == 52
     assert policy.parent_force_update is True
-    assert policy.parent_min_version_code == 49
+    assert policy.parent_min_version_code == 52
 
 
 def test_parent_switch_false_never_changes_child_force_behavior(monkeypatch):
@@ -50,6 +50,7 @@ def test_parent_switch_false_never_changes_child_force_behavior(monkeypatch):
     assert policy.child_force_update is True
     assert policy.child_min_version_code == 60
     assert policy.parent_force_update is False
+    assert policy.parent_min_version_code == 60
 
 
 def test_child_minimum_cannot_be_weakened_by_environment(monkeypatch):
@@ -59,10 +60,12 @@ def test_child_minimum_cannot_be_weakened_by_environment(monkeypatch):
     assert policy.child_force_update is True
 
 
-def test_impossible_parent_policy_is_rejected(monkeypatch):
-    with pytest.raises(RuntimeError):
-        _load(
-            monkeypatch,
-            ANDROID_LATEST_VERSION_CODE=40,
-            ANDROID_PARENT_MIN_VERSION_CODE=41,
-        )
+def test_parent_minimum_always_tracks_latest(monkeypatch):
+    policy = _load(
+        monkeypatch,
+        ANDROID_LATEST_VERSION_CODE=40,
+        ANDROID_PARENT_FORCE_UPDATE="true",
+        ANDROID_PARENT_MIN_VERSION_CODE=1,
+    )
+    assert policy.parent_force_update is True
+    assert policy.parent_min_version_code == 40
