@@ -58,13 +58,13 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _app_version_policy() -> schemas.AppVersionPolicyResponse:
     latest = _env_int("ANDROID_LATEST_VERSION_CODE", 11)
-    child_min = _env_int("ANDROID_CHILD_MIN_VERSION_CODE", latest)
+    # Family managers always follow the newest production version. There is
+    # intentionally no switch/minimum override that can weaken this rule.
+    child_min = latest
     parent_min = _env_int("ANDROID_PARENT_MIN_VERSION_CODE", latest)
     parent_force = _env_bool("ANDROID_PARENT_FORCE_UPDATE", False)
-    # Refuse an impossible policy that would force users to a version the
-    # server itself does not advertise as available.
-    if child_min > latest:
-        raise RuntimeError("ANDROID_CHILD_MIN_VERSION_CODE cannot exceed ANDROID_LATEST_VERSION_CODE")
+    # Parent forcing is opt-in, but when enabled it must still target a version
+    # that has already been published.
     if parent_min > latest:
         raise RuntimeError("ANDROID_PARENT_MIN_VERSION_CODE cannot exceed ANDROID_LATEST_VERSION_CODE")
     return schemas.AppVersionPolicyResponse(

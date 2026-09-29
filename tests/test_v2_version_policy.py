@@ -7,7 +7,6 @@ import pytest
 def _load(monkeypatch, **values):
     keys = [
         "ANDROID_LATEST_VERSION_CODE",
-        "ANDROID_CHILD_MIN_VERSION_CODE",
         "ANDROID_PARENT_FORCE_UPDATE",
         "ANDROID_PARENT_MIN_VERSION_CODE",
     ]
@@ -45,7 +44,6 @@ def test_parent_switch_false_never_changes_child_force_behavior(monkeypatch):
     policy = _load(
         monkeypatch,
         ANDROID_LATEST_VERSION_CODE=60,
-        ANDROID_CHILD_MIN_VERSION_CODE=60,
         ANDROID_PARENT_FORCE_UPDATE="false",
         ANDROID_PARENT_MIN_VERSION_CODE=40,
     )
@@ -54,10 +52,17 @@ def test_parent_switch_false_never_changes_child_force_behavior(monkeypatch):
     assert policy.parent_force_update is False
 
 
-def test_impossible_policy_is_rejected(monkeypatch):
+def test_child_minimum_cannot_be_weakened_by_environment(monkeypatch):
+    monkeypatch.setenv("ANDROID_CHILD_MIN_VERSION_CODE", "1")
+    policy = _load(monkeypatch, ANDROID_LATEST_VERSION_CODE=40)
+    assert policy.child_min_version_code == 40
+    assert policy.child_force_update is True
+
+
+def test_impossible_parent_policy_is_rejected(monkeypatch):
     with pytest.raises(RuntimeError):
         _load(
             monkeypatch,
             ANDROID_LATEST_VERSION_CODE=40,
-            ANDROID_CHILD_MIN_VERSION_CODE=41,
+            ANDROID_PARENT_MIN_VERSION_CODE=41,
         )
