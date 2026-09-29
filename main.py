@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session
 import models
 import schemas
 import v2_models  # noqa: F401 - registers V2 tables with the shared metadata
+from v2_notifications import localized_message, normalize_locale
 from database import Base, SessionLocal, engine, get_db
 from harmonyos_push import (
     DeliveryStatus,
@@ -1015,18 +1016,25 @@ def check_offline_alerts(db: Session) -> int:
 
     if sent_count:
         db.commit()
-    # V3 circles use their own relationship tables, but intentionally reuse
-    # the same threshold, pause, quiet-hours, and provider behavior.
-    # Older test/upgrade databases may not have received the additive V2
-    # adapter table yet; legacy offline alerts must continue to work there.
-    v2_settings = (
-        db.query(v2_models.OfflineAlertSetting).all()
-        if sqlalchemy_inspect(db.bind).has_table("v2_offline_alert_settings")
-        else []
-    )
-    for setting in v2_settings:
-        circle = db.get(v2_models.FamilyCircle, setting.family_circle_id)
-        if circle is None or circle.status.upper() != "ACTIVE" or not setting.offline_alert_enabled:
+    # V3 circles use their own relationship tables but intentionally reuse
+    # the same threshold, pause, quiet-hours, and provider behavior.  A missing
+    # settings row means the documented default policy (enabled, 6h), not that
+    # alerts are silently disabled. Persist the default row so cooldown state is durable.
+    if sqlalchemy_inspect(db.bind).has_table("v2_offline_alert_settings"):
+        active_circles = db.query(v2_models.FamilyCircle).filter(
+            v2_models.FamilyCircle.status == "ACTIVE"
+        ).all()
+    else:
+        active_circles = []
+    for circle in active_circles:
+        setting = db.query(v2_models.OfflineAlertSetting).filter(
+            v2_models.OfflineAlertSetting.family_circle_id == circle.id
+        ).first()
+        if setting is None:
+            setting = v2_models.OfflineAlertSetting(family_circle_id=circle.id)
+            db.add(setting)
+            db.flush()
+        if not setting.offline_alert_enabled:
             continue
         parent_profile = db.query(v2_models.ParentProfile).filter(
             v2_models.ParentProfile.family_circle_id == circle.id,
@@ -1052,11 +1060,15 @@ def check_offline_alerts(db: Session) -> int:
         if last_sent_at is not None and now - last_sent_at < timedelta(hours=12):
             continue
         organizer = db.get(models.User, circle.organizer_user_id)
+        parent_user = db.get(models.User, parent_profile.user_id)
         if organizer is None:
             continue
+        parent_name = parent_user.name if parent_user and parent_user.name else "Parent"
+        title, body = localized_message(
+            "offline_alert", normalize_locale(organizer.locale_tag), parent_name
+        )
         if _send_push_notification(
-            db, organizer, "家人长时间未在线", "可能是手机没电、关机或没有网络，请联系确认。",
-            event_type="offline_alert",
+            db, organizer, title, body, event_type="offline_alert"
         ):
             setting.last_alert_sent_at = now.isoformat(timespec="seconds")
             sent_count += 1

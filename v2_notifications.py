@@ -63,6 +63,15 @@ def localized_message(event_type: str, locale: str, parent_name: str) -> tuple[s
             "zh-CN": ("报平安提醒", f"请提醒 {parent_name} 完成报平安。"),
             "zh-TW": ("報平安提醒", f"請提醒 {parent_name} 完成報平安。"),
         },
+        "offline_alert": {
+            "en": ("Parent may be offline", f"{parent_name} has been offline for a while. Their phone may be off, out of battery, or without a connection."),
+            "pt": ("O familiar pode estar offline", f"{parent_name} está offline há algum tempo. O telefone pode estar desligado, sem bateria ou sem conexão."),
+            "pt-BR": ("O familiar pode estar offline", f"{parent_name} está offline há algum tempo. O telefone pode estar desligado, sem bateria ou sem conexão."),
+            "es": ("El familiar puede estar sin conexión", f"{parent_name} lleva un tiempo sin conexión. El teléfono puede estar apagado, sin batería o sin red."),
+            "ar": ("قد يكون الوالد غير متصل", f"{parent_name} غير متصل منذ فترة. قد يكون الهاتف مغلقًا أو بلا بطارية أو بلا اتصال."),
+            "zh-CN": ("家人可能未在线", f"{parent_name} 已有一段时间未在线。手机可能关机、没电或没有网络。"),
+            "zh-TW": ("家人可能未連線", f"{parent_name} 已有一段時間未連線。手機可能關機、沒電或沒有網路。"),
+        },
         "check_now": {
             "en": ("Check-in request", f"Please check in when you can, {parent_name}."),
             "pt": ("Pedido de check-in", f"Por favor, confirme que está bem, {parent_name}."),

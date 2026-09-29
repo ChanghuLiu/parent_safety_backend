@@ -860,3 +860,113 @@ def test_parent_disconnect_is_idempotent(v2_api):
     assert first.status_code == 200
     assert second.status_code == 200
     assert second.json()["status"] == "parent_disconnected"
+
+
+def test_v2_offline_alert_defaults_apply_without_existing_setting_row(v2_api, monkeypatch):
+    client, database = v2_api
+    import main
+    import models
+    import v2_models
+
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Offline manager", "v2-offline-manager")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "v2-offline-parent")
+    circle_response = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Offline family"})
+    assert circle_response.status_code == 200, circle_response.text
+    circle_id = circle_response.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invitation = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT", "relationship": "parent"},
+    )
+    assert invitation.status_code == 200, invitation.text
+    accepted = client.post(
+        f"/api/v2/invitations/{invitation.json()['token']}/accept",
+        headers=parent_headers,
+        json={},
+    )
+    assert accepted.status_code == 200, accepted.text
+
+    with database.SessionLocal() as db:
+        manager = db.get(models.User, organizer["user_id"])
+        manager.locale_tag = "en"
+        manager.fcm_token = "v2-offline-manager-token"
+        db.add(models.DeviceStatus(
+            user_id=parent["user_id"],
+            platform="android_google",
+            last_online_time=main._now() - timedelta(hours=7),
+        ))
+        # No settings row exists: documented defaults must still be effective.
+        assert db.query(v2_models.OfflineAlertSetting).filter(
+            v2_models.OfflineAlertSetting.family_circle_id == circle_id
+        ).count() == 0
+        db.commit()
+
+    sent = []
+    monkeypatch.setattr(main, "_send_fcm_notification", lambda token, title, body, *_args, **_kwargs: sent.append((title, body)) or True)
+    main._run_offline_alert_check()
+
+    with database.SessionLocal() as db:
+        setting = db.query(v2_models.OfflineAlertSetting).filter(
+            v2_models.OfflineAlertSetting.family_circle_id == circle_id
+        ).one()
+        assert setting.offline_alert_enabled is True
+        assert setting.offline_alert_hours == 6
+        assert setting.last_alert_sent_at is not None
+    assert len(sent) == 1
+    assert sent[0][0] == "Parent may be offline"
+
+
+def test_v2_offline_alert_respects_recent_parent_heartbeat(v2_api, monkeypatch):
+    client, database = v2_api
+    import main
+    import models
+    import v2_models
+
+    organizer, organizer_headers = _register(client, "FAMILY_MEMBER", "Online manager", "v2-online-manager")
+    parent, parent_headers = _register(client, "PARENT", "Parent", "v2-online-parent")
+    circle_response = client.post("/api/v2/family-circles", headers=organizer_headers, json={"name": "Online family"})
+    circle_id = circle_response.json()["id"]
+    _activate_test_circle(database, circle_id)
+    invitation = client.post(
+        f"/api/v2/family-circles/{circle_id}/invitations",
+        headers=organizer_headers,
+        json={"role": "PARENT", "relationship": "parent"},
+    )
+    accepted = client.post(
+        f"/api/v2/invitations/{invitation.json()['token']}/accept",
+        headers=parent_headers,
+        json={},
+    )
+    assert accepted.status_code == 200
+    saved = client.put(
+        f"/api/v2/family-circles/{circle_id}/offline-alert-settings",
+        headers=organizer_headers,
+        json={
+            "offline_alert_enabled": True,
+            "offline_alert_hours": 3,
+            "quiet_hours_enabled": False,
+            "quiet_start_time": "22:00",
+            "quiet_end_time": "07:00",
+            "pause_until": None,
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    heartbeat = client.post(
+        "/api/v2/devices/me/heartbeat",
+        headers=parent_headers,
+        json={
+            "device_id": "v2-online-parent",
+            "platform": "android_google",
+            "app_version": "1.0.43",
+            "battery_level": 80,
+            "locale_tag": "en",
+        },
+    )
+    assert heartbeat.status_code == 200, heartbeat.text
+    with database.SessionLocal() as db:
+        manager = db.get(models.User, organizer["user_id"]); manager.fcm_token = "v2-online-manager-token"; db.commit()
+    calls = []
+    monkeypatch.setattr(main, "_send_fcm_notification", lambda *_args, **_kwargs: calls.append(True) or True)
+    main._run_offline_alert_check()
+    assert calls == []
